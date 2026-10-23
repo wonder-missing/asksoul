@@ -1,0 +1,4128 @@
+#!/usr/bin/env python3
+"""asksoul — ask your Grok Bot main bot a question from a terminal.
+
+The CLI opens a short-lived TCP listener, posts a webhook so the bot wakes,
+and waits for the bot to dial back and answer over a signed, line-delimited
+JSON protocol. Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import curses
+import getpass
+import hashlib
+import hmac
+import ipaddress
+import json
+import locale
+import os
+import queue
+import re
+import secrets
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+import traceback
+import unicodedata
+import urllib.error
+import urllib.request
+import uuid
+from collections import deque
+from pathlib import Path
+from typing import Any, NoReturn, Optional
+
+try:  # Python 3.11+
+    import tomllib
+except ImportError:  # Python 3.9 / 3.10: the tiny flat parser below is used
+    tomllib = None  # type: ignore[assignment]
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_WEBHOOK = 2
+EXIT_TIMEOUT = 3
+EXIT_SETUP = 4
+EXIT_BAD_MAC = 5
+EXIT_RELAYED = 6
+EXIT_CLOSED = 7
+EXIT_WAIT = 8
+EXIT_ACKED = 9
+DELIVERY_WAIT_SEC = 60  # longest a call waits for its line's delivery outcome
+BAD_MAC_ABORT_AFTER = 3
+VERSION = "2026.10.23.5"
+
+ALG = "hmac-sha256-v1"
+DEFAULT_SOURCE = "asksoul"
+DEFAULT_WHO = "this host"
+MAX_WHO_CHARS = 64
+MAX_SOURCE_CHARS = 128
+MAX_FROM_CHARS = 64
+DEFAULT_TIMEOUT_SEC = 300
+MAX_TIMEOUT_SEC = 86400
+DEFAULT_WAIT_SEC = 300
+MIN_WAIT_SEC = 1
+MAX_WAIT_SEC = 86400
+SETTLE_SEC = 2.0
+DAEMON_READY_TIMEOUT = 5.0
+DAEMON_ATTACH_GRACE = 2.0
+ENDED_DRAIN_WAIT_SEC = 5
+OLD_DAEMON_STOP_WAIT = 2.0
+PID_POLL_SEC = 0.05
+CTL_RETRY_SEC = 0.02
+CTL_REPLY_TIMEOUT = 5.0
+EVENT_SEND_TIMEOUT = 5.0
+MESSAGE_HEAD_CHARS = 80
+LIST_HEAD_CHARS = 40
+LS_COLUMNS = (
+    "SESSION_ID",
+    "PID",
+    "OPENED_AGO",
+    "STATE",
+    "WHO",
+    "CALLER_CWD",
+    "FIRST_MSG",
+)
+CALLER_CMD_CHARS = 200
+SESSION_DIR_MODE = 0o700
+SESSION_FILE_MODE = 0o600
+META_NAME = "meta.json"
+CTL_NAME = "ctl.sock"
+LOG_NAME = "log"
+# Internal, spawn_daemon -> daemon_entry only; never in HELP.
+DAEMON_FD_ENV = "ASKSOUL_DAEMON_FD"
+OP_ATTACH = "attach"
+OP_MSG = "msg"
+OP_CLOSE = "close"
+OP_INFO = "info"
+END_CLOSED = "closed"
+END_TIMEOUT = "timeout"
+END_BAD_MAC = "bad_mac"
+END_LOCAL_CLOSE = "local_close"
+END_REPLACED = "replaced"
+END_CODES = {
+    END_CLOSED: EXIT_CLOSED,
+    END_TIMEOUT: EXIT_TIMEOUT,
+    END_BAD_MAC: EXIT_BAD_MAC,
+    END_LOCAL_CLOSE: EXIT_OK,
+    END_REPLACED: EXIT_USAGE,
+}
+WEBHOOK_ATTEMPTS = 3
+WEBHOOK_BACKOFF_SEC = (2, 5)
+WEBHOOK_HTTP_TIMEOUT_SEC = 10
+MAX_FRAME_BYTES = 1024 * 1024
+HELP_WIDTH = 79
+USER_AGENT = "asksoul/2"
+DEFAULT_BOT_NAME = "Soul"
+DEFAULT_CONFIG_DIR = Path.home() / ".config" / "asksoul"
+DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.toml"
+DEFAULT_SECRET_PATH = DEFAULT_CONFIG_DIR / "secret"
+MAX_BOT_NAME_CHARS = 64
+MAX_SESSION_ID_CHARS = 128
+SESSION_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,%d}$" % (MAX_SESSION_ID_CHARS - 1)
+)
+QUEUED_AT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$"
+)
+KIND_STATUS = "status"
+KIND_MSG = "msg"
+KIND_CLOSE = "close"
+KIND_RELAYED = "relayed"
+KIND_ACK = "ack"
+INBOUND_KINDS = frozenset(
+    {KIND_STATUS, KIND_MSG, KIND_CLOSE, KIND_RELAYED, KIND_ACK}
+)
+CMD_DEFAULT = "default"
+CMD_SESSION = "session"
+CMD_WAIT = "wait"
+CMD_CLOSE = "close"
+CMD_LS = "ls"
+CMD_TUI = "tui"
+CMD_INIT = "init"
+SUBCOMMANDS = (CMD_LS, CMD_CLOSE, CMD_WAIT, CMD_TUI, CMD_INIT)
+STATE_LIVE = "live"
+STATE_ENDED = "ended"
+STATE_STALE = "stale"
+TUI_INPUT_MAX_ROWS = 3
+TUI_TICK_MS = 100
+TUI_INFO_POLL_SEC = 2.0
+TUI_SCROLL_PAGE_MARGIN = 2
+TUI_MAX_ENTRIES = 4000
+TUI_ATTACH_WAIT_SEC = 2.0
+# DECSET 2004 bracketed paste: terminals wrap pasted text in these CSI marks.
+TUI_BRACKETED_PASTE_ON = b"\x1b[?2004h"
+TUI_BRACKETED_PASTE_OFF = b"\x1b[?2004l"
+TUI_PASTE_BEGIN = "[200~"
+TUI_PASTE_END = "[201~"
+TUI_ESC_PEEK_MS = 30
+TUI_HELP_LINES = (
+    "# tui commands:",
+    "#   /help          this help",
+    "#   /clear         clear the transcript view (session stays open)",
+    "#   /wait          wait for the next inbound message, send nothing",
+    "#   /close, /quit  close the session and exit",
+    "# PgUp/PgDn scroll the transcript; Up/Down scroll one line;",
+    "# Esc clears the draft; Ctrl-L redraws.",
+    "# Paste keeps newlines in one draft; Enter outside a paste sends.",
+    "# Ctrl-C cancels a wait and leaves the session open; Ctrl-C while",
+    "# idle closes the session and exits.",
+)
+
+TAILSCALE_CANDIDATES = (
+    "tailscale",
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+)
+
+HELP = r"""asksoul {version}: ask your Grok Bot main bot from this terminal.
+
+Give your bot this repo and let it set up; SETUP.md walks it through. This
+help is the CLI reference.
+
+CLI
+---
+
+Usage:
+  asksoul [-s ID] [-w WHO] [-t SEC] [--wait SEC] [--json] [--] MESSAGE
+  asksoul wait ID [--wait SEC]    read the next answer, say nothing
+  asksoul close ID                end the conversation
+  asksoul ls                      open conversations (header row first)
+  asksoul tui [-s ID] [-w WHO] [-t SEC] [--wait SEC]
+                                  interactive chat in this terminal
+  asksoul init [options]          write the config file
+  asksoul -h | --version
+
+The default command says MESSAGE and prints {bot}'s answer. A MESSAGE that
+is literally ls, wait, close, tui or init goes after --:  asksoul -- ls
+
+Three delivery layers, weakest first:
+  1. ack      "# ack (by {bot})" / "DELIVERY ack"
+              {bot} received your line.
+  2. relayed  "# relayed: <bot> (by {bot})" / "DELIVERY relayed"
+              handed to a teammate bot; not proof that bot read it.
+  3. [bot]    "[<name>] ..."   the bot itself answered.
+If --wait ends with no ack the status is "unconfirmed". With --json the same
+status is also one line of JSON: {"delivery":"ack"|"relayed"|"unconfirmed"}.
+
+Exit codes (take the code from the call itself, not from a pipe):
+  0  got an answer (session still open), or close <ID> done
+  1  usage / no open session / Ctrl-C (the conversation goes on)
+  2  could not reach the bot (webhook failed); not delivered, not kept
+  3  conversation ended by -t silence
+  4  fatal setup (config / bind / allowlist / crypto)
+  5  ended after 3 consecutive bad MACs (start a new session)
+  6  a relayed arrived: done, never resend; wait <ID> may still read a line
+  7  the bot closed the conversation
+  8  --wait ran out with nothing yet; wait <ID> keeps waiting
+  9  only an ack arrived; wait <ID> keeps waiting
+
+Conversations. -s ID names one session. Without -s a fresh ID is printed on
+stderr: "asksoul: session <ID> (continue with -s <ID>)". Each call says one
+line and returns after one turn; the conversation stays open until
+close <ID>, or until -t seconds pass with nothing said by either side.
+
+stdout:
+  [{bot}] <text>                          the bot said this
+  [{bot}, queued 2026-10-09 21:15 +08:00] <text>   said earlier, delivered late
+  # ack (by <from>)                       <from> received your line
+  # relayed: <bot> (by {bot})             handed to a teammate bot
+  DELIVERY ack|relayed|unconfirmed        machine-readable status
+stderr carries diagnostics only.
+
+Options:
+  -h, --help            this text
+  -w, --who WHO         self-name for this run
+  -t, --timeout SEC     idle seconds before the conversation ends (default
+                        300, 1..86400); set when the session opens
+  -s, --session ID      1..128 of A-Z a-z 0-9 . _ : -, starting with a
+                        letter or digit
+      --wait SEC        this call waits at most SEC seconds for an answer
+                        (default 300, 1..86400); the conversation stays open
+      --json            also print one delivery JSON line
+
+The bot is woken by the webhook; a cold start often needs a minute or more.
+Set --wait / -t in minutes, not a few seconds. If the bot asks something,
+answer with -s <ID>. Close when the exchange is done, not after the first
+line.
+
+TUI
+---
+
+  asksoul tui [-s ID] [-w WHO] [-t SEC] [--wait SEC]
+
+A small curses chat, stdlib only: one status line (session, who, idle), a
+scrollable transcript and a 1-3 line input. No MESSAGE argument: the session
+opens on the first Enter and that line is its first message. TUI is a
+continuous conversation: {bot} answers with ask (or send without close) and
+must not close after each turn — only on /close, idle timeout, or an explicit
+end.
+Without -s a fresh id is made and printed once on stderr; -w / -t / --wait
+work as above (-w and -t only when the TUI opens the session). Inbound frames
+appear while idle. msg and relayed use the same "[from] ..." / "# relayed:
+..." lines as stdout; status frames are "# status: ..."; the local echo is
+"[you] ...".
+Keys: Enter sends; Backspace edits; Esc clears the draft; PgUp/PgDn scroll
+the transcript (Up/Down one line); Ctrl-L redraws. Pasted text keeps embedded
+newlines in one draft; Enter outside a paste still sends. Ctrl-C cancels a
+wait and leaves the session open; Ctrl-C while idle closes the session and
+exits 0. A non-TTY run prints "asksoul tui needs a TTY" and exits 2.
+Slash commands (Enter):
+  /help            short help in the transcript
+  /clear           clear the transcript view (the session stays open)
+  /wait            wait for the next inbound message, send nothing
+  /close, /quit    close the session and exit
+  other /...       shown locally; never sent as a message
+
+Setup
+-----
+
+Config: ~/.config/asksoul/config.toml (mode 0600). `asksoul init` writes it,
+interactively or with flags:
+  asksoul init --webhook-url URL --bot-name NAME --accept HOST[,HOST...] \
+      --secret-cmd 'security find-generic-password -s asksoul -w'
+  asksoul init --webhook-url URL --secret-stdin   # secret from stdin to a file
+  asksoul init --non-interactive --webhook-url URL # no prompts
+
+Config keys (flat TOML):
+  bot_name          main bot name in output (default "Soul")
+  webhook_url       webhook URL from the routine trigger (required)
+  accept            list/comma list of IPs or hostnames allowed to dial back
+  accept_ssh_host   optional ssh config Host whose HostName is allowed
+  bind              local IPv4 to listen on (default: `tailscale ip -4`)
+  secret_cmd        shell command whose stdout is the webhook secret
+  secret_file       file containing the secret (must be mode 0600)
+  who, source       optional caller identity
+  transport         optional free-form label (default "tcp-tailnet")
+
+Environment overrides: ASKSOUL_CONFIG, ASKSOUL_WEBHOOK_URL,
+ASKSOUL_WEBHOOK_SECRET, ASKSOUL_BOT_NAME, ASKSOUL_ACCEPT, ASKSOUL_BIND,
+ASKSOUL_ACCEPT_SSH_HOST, ASKSOUL_SECRET_CMD, ASKSOUL_SECRET_FILE,
+ASKSOUL_WHO, ASKSOUL_SOURCE, ASKSOUL_TAILSCALE.
+Secret precedence: ASKSOUL_WEBHOOK_SECRET > secret_cmd > secret_file.
+The config holds no secret unless you choose secret_file. Never paste the
+webhook secret into chat.
+
+Test hook: ASKSOUL_NO_WEBHOOK=1 skips the POST and prints the dial-back
+host/port/key_b64/session_id as one JSON line on stderr. It is for local
+protocol tests only.
+
+How it works
+------------
+
+Opening a session binds a TCP listener on the configured bind address and an
+ephemeral port with a fresh 32-byte key, POSTs the webhook, and starts a
+background session process (no terminal). Each asksoul call talks to that
+process and returns after one turn. If no bot is connected when a -s line
+arrives, the process re-POSTs the webhook for the same session_id and the bot
+dials in again. Every webhook POST retries network errors, 429 and 5xx up to
+3 times, then the call exits 2.
+
+The listener accepts only peers on the accept allowlist. One bot connection
+at a time; sequential reconnects are fine. A bot that disconnects without
+close does not end the session.
+
+Protocol
+--------
+
+Webhook payload:
+  {"source":...,"who":...,"sender_type":"user-cli"|"user-tui",
+   "intent":"asksoul","message":...,"session_id":...,
+   "reply":{"required":true,"mode":"session","transport":"tcp-tailnet",
+            "host":...,"port":...,"timeout_sec":...,
+            "crypto":{"alg":"hmac-sha256-v1","key_b64":...},
+            "accept":"session","note":...}}
+
+The bot dials reply.host:reply.port and sends line-delimited JSON frames:
+  {"v":1,"alg":"hmac-sha256-v1","kind":...,"session_id":...,
+   "from":...,"mac_b64":...,"body_b64":...}
+MAC (bytes): body; or from + "\n" + body; with queued_at:
+from + "\0" + queued_at + "\n" + body. Kinds: status (stderr only), msg
+(text), relayed (hand-off receipt), close (end the session), ack (automatic
+first frame on every dial, before anything else). Three consecutive bad
+MACs end the session (exit 5). Full reference: docs/protocol.md.
+
+The bot-side helper is `asksoul-talk` on PATH (installed with this repo's
+bot/asksoul-talk).
+"""
+
+
+USAGE = (
+    'asksoul [-s ID] [-w WHO] [-t SEC] [--wait SEC] [--] MESSAGE\n'
+    '                  talk (the default)\n'
+    'asksoul wait ID [--wait SEC]   next turn, send nothing\n'
+    'asksoul close ID               end the session\n'
+    'asksoul ls                     open sessions (header row first)\n'
+    'asksoul tui [-s ID] [-w WHO] [-t SEC] [--wait SEC]\n'
+    '                  interactive chat in this terminal\n'
+    'asksoul init [options]         write the config file\n'
+    'asksoul -h                     this text'
+)
+
+
+class UsageError(Exception):
+    pass
+
+
+class SetupError(Exception):
+    pass
+
+
+class WebhookError(Exception):
+    def __init__(self, detail: str, attempts: int = 1) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.attempts = attempts
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def eprint(msg: str) -> None:
+    sys.stderr.write(f"asksoul: {msg}\n")
+    try:
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+
+def _split_comment(line: str) -> str:
+    """Strip a # comment that is outside quotes."""
+    out: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    for ch in line:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if quote == '"' and ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if quote is not None:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            continue
+        if ch == "#":
+            break
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def _split_array(text: str) -> list[str]:
+    items: list[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    escaped = False
+    start = 0
+    for index, ch in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and ch == "\\":
+            escaped = True
+            continue
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            items.append(text[start:index].strip())
+            start = index + 1
+    tail = text[start:].strip()
+    if tail:
+        items.append(tail)
+    return [item for item in items if item]
+
+
+def _parse_toml_value(raw: str) -> Any:
+    raw = raw.strip()
+    if raw.startswith('"'):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return raw.strip('"')
+    if raw.startswith("'"):
+        return raw[1:-1] if raw.endswith("'") else raw[1:]
+    if raw.startswith("[") and raw.endswith("]"):
+        return [_parse_toml_value(item) for item in _split_array(raw[1:-1])]
+    lowered = raw.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if re.fullmatch(r"[+-]?\d+", raw):
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    if re.fullmatch(r"[+-]?\d+\.\d+", raw):
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return raw
+
+
+def _parse_flat_toml(text: str) -> dict[str, Any]:
+    """The Python 3.9/3.10 fallback: flat key = value, string arrays allowed.
+
+    Sections are flattened to dotted keys; nested tables are not otherwise
+    interpreted. The config this tool writes is flat.
+    """
+    data: dict[str, Any] = {}
+    section = ""
+    for raw in text.splitlines():
+        line = _split_comment(raw)
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if "=" not in line:
+            raise UsageError(f"config line is not key = value: {raw.strip()!r}")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise UsageError(f"config line has an empty key: {raw.strip()!r}")
+        full = f"{section}.{key}" if section else key
+        data[full] = _parse_toml_value(value)
+    return data
+
+
+def parse_toml(text: str) -> dict[str, Any]:
+    """Parse config.toml; stdlib tomllib on 3.11+, tiny flat parser before."""
+    if tomllib is not None:
+        try:
+            return tomllib.loads(text)
+        except Exception as exc:  # tomllib.TOMLDecodeError, ValueError
+            raise UsageError(f"config.toml is not valid TOML: {exc}") from exc
+    return _parse_flat_toml(text)
+
+
+def config_path() -> Path:
+    override = os.environ.get("ASKSOUL_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_CONFIG_PATH
+
+
+def load_config_data(path: Optional[Path] = None) -> dict[str, Any]:
+    """Read config.toml. A missing file is an empty config."""
+    cfg_path = path.expanduser() if path is not None else config_path()
+    try:
+        text = cfg_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise UsageError(f"cannot read config {cfg_path}: {exc}") from exc
+    try:
+        st = cfg_path.stat()
+        if st.st_mode & 0o077:
+            eprint(f"warn {cfg_path} mode {st.st_mode & 0o777:o} should be 0600")
+    except OSError:
+        pass
+    data = parse_toml(text)
+    return data if isinstance(data, dict) else {}
+
+
+def _clean_ident(value: str, what: str, max_chars: int) -> str:
+    text = value.strip()
+    if not text or "\n" in text or "\r" in text:
+        raise UsageError(f"{what} is empty or contains a newline")
+    if len(text) > max_chars:
+        raise UsageError(f"{what} longer than {max_chars} characters")
+    return text
+
+
+def config_value(data: dict[str, Any], env_name: str, key: str) -> Any:
+    """Env wins over the file (env may legitimately be an empty string)."""
+    if env_name in os.environ:
+        return os.environ[env_name]
+    return data.get(key)
+
+
+def identity_from_data(data: dict[str, Any]) -> tuple[str, str]:
+    who_raw = config_value(data, "ASKSOUL_WHO", "who")
+    source_raw = config_value(data, "ASKSOUL_SOURCE", "source")
+    who = (
+        _clean_ident(str(who_raw), "WHO", MAX_WHO_CHARS)
+        if str(who_raw or "").strip()
+        else DEFAULT_WHO
+    )
+    source = (
+        _clean_ident(str(source_raw), "SOURCE", MAX_SOURCE_CHARS)
+        if str(source_raw or "").strip()
+        else DEFAULT_SOURCE
+    )
+    return who, source
+
+
+def bot_name_from_data(data: dict[str, Any]) -> str:
+    raw = config_value(data, "ASKSOUL_BOT_NAME", "bot_name")
+    if not str(raw or "").strip():
+        return DEFAULT_BOT_NAME
+    return _clean_ident(str(raw), "bot_name", MAX_BOT_NAME_CHARS)
+
+
+def webhook_url_from_data(data: dict[str, Any]) -> str:
+    raw = config_value(data, "ASKSOUL_WEBHOOK_URL", "webhook_url")
+    url = str(raw or "").strip()
+    if not url:
+        raise UsageError(
+            "no webhook_url; run `asksoul init` or set ASKSOUL_WEBHOOK_URL"
+        )
+    if not (url.startswith("https://") or url.startswith("http://")):
+        raise UsageError("webhook_url must start with http:// or https://")
+    return url
+
+
+def resolve_secret(data: dict[str, Any]) -> str:
+    """ASKSOUL_WEBHOOK_SECRET > secret_cmd > secret_file (mode 0600)."""
+    env_secret = os.environ.get("ASKSOUL_WEBHOOK_SECRET")
+    if env_secret is not None and env_secret.strip():
+        return env_secret.strip()
+
+    cmd_raw = config_value(data, "ASKSOUL_SECRET_CMD", "secret_cmd")
+    cmd = str(cmd_raw or "").strip()
+    if cmd:
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise UsageError(f"secret_cmd failed: {exc}") from exc
+        secret = proc.stdout.strip()
+        if proc.returncode != 0:
+            raise UsageError(f"secret_cmd exited {proc.returncode}")
+        if not secret:
+            raise UsageError("secret_cmd printed an empty secret")
+        return secret
+
+    file_raw = config_value(data, "ASKSOUL_SECRET_FILE", "secret_file")
+    file_text = str(file_raw or "").strip()
+    if file_text:
+        path = Path(file_text).expanduser()
+        try:
+            st = path.stat()
+        except OSError as exc:
+            raise UsageError(f"cannot read secret_file {path}: {exc}") from exc
+        if st.st_mode & 0o077:
+            raise UsageError(
+                f"secret_file {path} mode {st.st_mode & 0o777:o} must be 0600"
+            )
+        try:
+            secret = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise UsageError(f"cannot read secret_file {path}: {exc}") from exc
+        if not secret:
+            raise UsageError(f"secret_file {path} is empty")
+        return secret
+
+    raise UsageError(
+        "no webhook secret; set ASKSOUL_WEBHOOK_SECRET, or configure "
+        "secret_cmd / secret_file (see `asksoul init`)"
+    )
+
+
+def load_runtime_config(require_webhook: bool = True) -> dict[str, Any]:
+    """Resolve config + env. With require_webhook=False (test hook), the URL
+    and secret may be absent; identity and bot name are still resolved."""
+    data = load_config_data()
+    who, source = identity_from_data(data)
+    bot_name = bot_name_from_data(data)
+    url = secret = ""
+    if require_webhook:
+        url = webhook_url_from_data(data)
+        secret = resolve_secret(data)
+    return {
+        "url": url,
+        "secret": secret,
+        "who": who,
+        "source": source,
+        "bot_name": bot_name,
+        "data": data,
+    }
+
+
+def peek_config() -> tuple[str, str, str]:
+    """WHO/SOURCE/bot_name for --help. Config and env are optional."""
+    try:
+        data = load_config_data()
+        who, source = identity_from_data(data)
+        bot_name = bot_name_from_data(data)
+        return who, source, bot_name
+    except (UsageError, OSError):
+        return DEFAULT_WHO, DEFAULT_SOURCE, DEFAULT_BOT_NAME
+
+
+def render_help(who: str, source: str, bot_name: str = DEFAULT_BOT_NAME) -> str:
+    return (
+        HELP.replace("{bot}", bot_name)
+        .replace("{who}", who)
+        .replace("{source}", source)
+        .replace("{version}", VERSION)
+    )
+
+
+def which_tailscale() -> str:
+    override = os.environ.get("ASKSOUL_TAILSCALE")
+    if override:
+        if os.access(override, os.X_OK):
+            return override
+        raise SetupError("ASKSOUL_TAILSCALE is not executable")
+    for cand in TAILSCALE_CANDIDATES:
+        if os.path.sep in cand:
+            if os.access(cand, os.X_OK):
+                return cand
+        else:
+            found = shutil.which(cand)
+            if found:
+                return found
+    raise SetupError("tailscale not found")
+
+
+def run_tailscale(args: list[str], timeout: float = 8.0) -> str:
+    bin_path = which_tailscale()
+    try:
+        proc = subprocess.run(
+            [bin_path, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SetupError(f"tailscale {' '.join(args)} failed") from exc
+    if proc.returncode != 0:
+        raise SetupError(f"tailscale {' '.join(args)} exit {proc.returncode}")
+    return proc.stdout
+
+
+def first_ipv4_line(text: str) -> str:
+    for line in text.splitlines():
+        ip = line.strip()
+        if ip and ":" not in ip:
+            return ip
+    raise SetupError("no Tailscale IPv4 in command output")
+
+
+def self_bind_ipv4(data: dict[str, Any]) -> str:
+    """Local address to listen on: config bind > ASKSOUL_BIND > tailscale."""
+    override = config_value(data, "ASKSOUL_BIND", "bind")
+    if str(override or "").strip():
+        return str(override).strip()
+    try:
+        return first_ipv4_line(run_tailscale(["ip", "-4"]))
+    except SetupError as exc:
+        raise SetupError(
+            "cannot determine the bind address; set `bind` in config.toml "
+            "or ASKSOUL_BIND, or install Tailscale"
+        ) from exc
+
+
+def _accept_entries(data: dict[str, Any]) -> list[str]:
+    raw = config_value(data, "ASKSOUL_ACCEPT", "accept")
+    entries: list[str] = []
+    if raw is None:
+        return entries
+    values = raw if isinstance(raw, list) else str(raw).split(",")
+    for value in values:
+        if isinstance(value, str):
+            entries.extend(part.strip() for part in value.split(",") if part.strip())
+        elif value is not None:
+            entries.append(str(value).strip())
+    return entries
+
+
+def resolve_accept_host(value: str) -> set[str]:
+    """One accept entry -> IPv4 literal(s) or a CIDR string."""
+    text = value.strip()
+    if not text:
+        return set()
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        address = None
+    if address is not None:
+        if address.version != 4:
+            raise SetupError(f"accept {text!r} is not IPv4")
+        return {text}
+    try:
+        network = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        network = None
+    if network is not None:
+        if network.version != 4:
+            raise SetupError(f"accept {text!r} is not IPv4")
+        return {str(network)}
+    try:
+        infos = socket.getaddrinfo(text, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise SetupError(f"cannot resolve accept host {text!r}") from exc
+    ips = {str(info[4][0]) for info in infos}
+    if not ips:
+        raise SetupError(f"accept host {text!r} resolved to no IPv4 address")
+    return ips
+
+
+def ssh_host_ipv4s(alias: str) -> set[str]:
+    """Resolve an ssh config Host's HostName (accept_ssh_host)."""
+    try:
+        proc = subprocess.run(
+            ["ssh", "-G", alias],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SetupError(f"ssh -G {alias} failed") from exc
+    if proc.returncode != 0:
+        raise SetupError(f"ssh -G {alias} exit {proc.returncode}")
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].lower() == "hostname":
+            return resolve_accept_host(parts[1].strip())
+    raise SetupError(f"no HostName in ssh -G {alias}")
+
+
+def accept_list(data: dict[str, Any]) -> set[str]:
+    """Peers allowed to dial back: config/env accept + optional ssh Host."""
+    entries = _accept_entries(data)
+    ssh_host = str(
+        config_value(data, "ASKSOUL_ACCEPT_SSH_HOST", "accept_ssh_host") or ""
+    ).strip()
+    allowed: set[str] = set()
+    for entry in entries:
+        allowed |= resolve_accept_host(entry)
+    if ssh_host:
+        allowed |= ssh_host_ipv4s(ssh_host)
+    if not allowed:
+        raise SetupError(
+            "empty accept allowlist; set `accept` in config.toml or "
+            "ASKSOUL_ACCEPT to the bot computer's IP or hostname"
+        )
+    return allowed
+
+
+def peer_allowed(peer_ip: str, allow: set[str]) -> bool:
+    """Exact IP match or membership in a configured CIDR."""
+    try:
+        addr = ipaddress.ip_address(peer_ip)
+    except ValueError:
+        return peer_ip in allow
+    for entry in allow:
+        if entry == peer_ip:
+            return True
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            continue
+        if network.version == addr.version and addr in network:
+            return True
+    return False
+
+
+def bind_listener(host: str) -> tuple[socket.socket, int]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if hasattr(sock, "set_inheritable"):
+            sock.set_inheritable(False)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, 0))
+        sock.listen(8)
+        port = int(sock.getsockname()[1])
+    except OSError as exc:
+        sock.close()
+        raise SetupError(f"bind {host}:0 failed") from exc
+    return sock, port
+
+
+def b64encode(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def b64decode(text: str) -> Optional[bytes]:
+    try:
+        raw = text.encode("ascii")
+    except (UnicodeEncodeError, AttributeError):
+        return None
+    try:
+        return base64.b64decode(raw, validate=True)
+    except (ValueError, TypeError):
+        try:
+            return base64.b64decode(raw)
+        except (ValueError, TypeError):
+            return None
+
+
+def make_key() -> bytes:
+    return secrets.token_bytes(32)
+
+
+def build_payload(
+    message: str,
+    reply: dict[str, Any],
+    session_id: str,
+    source: str = DEFAULT_SOURCE,
+    who: str = DEFAULT_WHO,
+    sender_type: str = "user-cli",
+) -> dict[str, Any]:
+    """The webhook body. session_id and reply are required and always written."""
+    return {
+        "source": source,
+        "who": who,
+        "sender_type": sender_type,
+        "intent": "asksoul",
+        "message": message,
+        "reply": reply,
+        "session_id": session_id,
+    }
+
+
+def reply_note(who: str = DEFAULT_WHO) -> str:
+    """The reply.note string sent to the bot with every webhook."""
+    del who  # kept for signature compatibility; the note speaks as "the CLI"
+    return (
+        "Dial host:port with this key. hmac-sha256-v1: "
+        "mac=HMAC-SHA256(key, body_utf8). Line-delimited JSON both ways, one "
+        "whole line + flush per frame. Every frame carries this session_id. "
+        "One active connection at a time; sequential reconnects OK. Every "
+        "frame needs kind, one of five (missing or other kinds are "
+        "discarded): status = control/diagnostic (the CLI prints it to "
+        "stderr only); msg = text (the CLI prints it to stdout; body ends "
+        "with \\n); relayed = hand-off receipt: the receiver handed the "
+        "message to the named bot (body = bot name); it does not mean that "
+        "bot received or read it; close = ends the session; ack = the dialer "
+        "named in from has received this session's latest line(s) (empty "
+        "body; the dialer sends it automatically on every dial, before its "
+        "other frames; it is not an answer). Frames may carry from = the "
+        "sender's own name (1..64 chars, no [ ] or control chars); with "
+        "from, mac=HMAC-SHA256(key, from_utf8 + \"\\n\" + body_utf8). A frame "
+        "may also carry queued_at (ISO 8601 with seconds and offset, the "
+        "original send attempt; msg or relayed only, and only with from); "
+        "then mac=HMAC-SHA256(key, from_utf8 + \"\\0\" + queued_at + \"\\n\" "
+        "+ body_utf8). The CLI shows it as queued at that time; the "
+        "outbox sets it when it flushes a stored frame. The CLI prints a msg "
+        "as \"[<from>] <body>\", a relayed as \"# relayed: <name> (by "
+        "<from>)\" and an ack as \"# ack (by <from>)\", with ? when from is "
+        "absent. Disconnecting without close does not end the session; the "
+        "listener keeps waiting. The CLI waits until close or its timeout; "
+        "timeout_sec is an idle timeout, reset by any frame from the "
+        "receiver or any line the caller sends. A relayed makes that turn "
+        "exit 6 and it will not resend, and a msg may still arrive on this "
+        "session before close; an ack with no msg and no relayed makes the "
+        "turn exit 9. The same session_id may arrive again in a new webhook "
+        "carrying the same host, port and key: that is the caller's next "
+        "line in this same session, dial in as usual. Webhooks with the same "
+        "session_id belong to one thread. Every webhook carries a reply "
+        "channel. The receiver decides what to do with the message: answer "
+        "it, hand it to another bot, or ask back; a hand-off may be "
+        "confirmed with relayed. Bot-side helper: `asksoul-talk` on PATH "
+        "(--from NAME; the main bot name defaults to the configured "
+        "bot_name), subcommands send, relayed, close, ask: one-shot send "
+        "(kind msg), relayed --to NAME, close; ask --wait SEC --body TEXT "
+        "sends, keeps the connection and prints the caller's next line "
+        "(exit 0 got it, 3 timeout, 7 closed), for when an answer is "
+        "expected. A line the caller sends while no bot is connected comes "
+        "as that new webhook."
+    )
+
+
+def reply_object(
+    host: str,
+    port: int,
+    timeout_sec: int,
+    key: bytes,
+    who: str = DEFAULT_WHO,
+) -> dict[str, Any]:
+    return {
+        "required": True,
+        "mode": "session",
+        "transport": "tcp-tailnet",
+        "host": host,
+        "port": port,
+        "timeout_sec": timeout_sec,
+        "crypto": {
+            "alg": ALG,
+            "key_b64": b64encode(key),
+        },
+        "accept": "session",
+        "note": reply_note(who),
+    }
+
+
+def _retryable_http(code: int) -> bool:
+    """429 and 5xx are worth a retry; other HTTP codes are not."""
+    return code == 429 or 500 <= code <= 599
+
+
+def post_webhook(url: str, sender_key: str, payload: dict[str, Any]) -> None:
+    """POST the payload, retrying network errors, timeouts, 429 and 5xx.
+
+    Up to WEBHOOK_ATTEMPTS tries, sleeping WEBHOOK_BACKOFF_SEC between
+    them. A WebhookError detail names the attempts made and the last
+    error.
+    """
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    auth = sender_key if sender_key.lower().startswith("bearer ") else f"Bearer {sender_key}"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": auth,
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+    attempts = 0
+    last = ""
+    while True:
+        attempts += 1
+        retry = False
+        try:
+            with _OPENER.open(req, timeout=WEBHOOK_HTTP_TIMEOUT_SEC) as resp:
+                code = getattr(resp, "status", None) or resp.getcode()
+                try:
+                    resp.read(4096)
+                except OSError:
+                    pass
+            if code and 200 <= int(code) < 300:
+                return
+            last = f"HTTP {code or '?'}"
+            retry = _retryable_http(int(code or 0))
+        except urllib.error.HTTPError as exc:
+            code = int(getattr(exc, "code", 0) or 0)
+            try:
+                exc.read(256)
+            except OSError:
+                pass
+            last = f"HTTP {code or '?'}"
+            retry = _retryable_http(code)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            last = "network error"
+            retry = True
+        if not retry or attempts >= WEBHOOK_ATTEMPTS:
+            word = "attempt" if attempts == 1 else "attempts"
+            raise WebhookError(f"{attempts} {word}, last: {last}", attempts)
+        pause = WEBHOOK_BACKOFF_SEC[attempts - 1]
+        eprint(
+            f"webhook attempt {attempts}/{WEBHOOK_ATTEMPTS} failed "
+            f"({last}), retrying in {pause} s"
+        )
+        time.sleep(pause)
+
+
+def pop_json_lines(buf: bytearray) -> list[bytes]:
+    lines: list[bytes] = []
+    while True:
+        nl = buf.find(b"\n")
+        if nl == -1:
+            break
+        line = bytes(buf[:nl])
+        del buf[: nl + 1]
+        if line.endswith(b"\r"):
+            line = line[:-1]
+        lines.append(line)
+    if len(buf) > MAX_FRAME_BYTES:
+        eprint("frame exceeds 1MiB, discarded")
+        buf.clear()
+    return lines
+
+
+def valid_from_name(name: object) -> bool:
+    """Frame "from": 1..64 chars, no control chars, no [ or ], not only spaces."""
+    if not isinstance(name, str) or not 1 <= len(name) <= MAX_FROM_CHARS:
+        return False
+    if not name.strip():
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        return False
+    return "[" not in name and "]" not in name
+
+
+def valid_queued_at(value: object) -> bool:
+    """Frame "queued_at": ISO 8601, seconds, explicit offset."""
+    return isinstance(value, str) and QUEUED_AT_RE.fullmatch(value) is not None
+
+
+def frame_mac(
+    key: bytes,
+    from_name: Optional[str],
+    body: bytes,
+    queued_at: Optional[str] = None,
+) -> bytes:
+    """Canonical MAC input (bytes, UTF-8), by what the frame carries:
+      no queued_at, no from:  body
+      no queued_at, from:     from + "\\n" + body
+      queued_at, from:        from + "\\0" + queued_at + "\\n" + body
+
+    queued_at is valid only together with from; calling this with
+    queued_at and no from is a bug in the caller.
+    """
+    if queued_at is None:
+        if from_name is None:
+            return hmac.new(key, body, hashlib.sha256).digest()
+        data = from_name.encode("utf-8") + b"\n" + body
+    else:
+        if from_name is None:
+            raise ValueError("queued_at requires from")
+        data = (
+            from_name.encode("utf-8")
+            + b"\x00"
+            + queued_at.encode("utf-8")
+            + b"\n"
+            + body
+        )
+    return hmac.new(key, data, hashlib.sha256).digest()
+
+
+def verify_frame(
+    line: bytes,
+    key: bytes,
+    expect_session_id: Optional[str] = None,
+) -> tuple[
+    bool, str, Optional[str], Optional[bytes], Optional[str], Optional[str]
+]:
+    """(ok, reason, kind, body, from_name, queued_at).
+
+    reason never contains the key. queued_at is returned only for a
+    validated value on msg/relayed; status/close/ack reject it.
+    """
+    if not line.strip():
+        return False, "empty frame, discarded", None, None, None, None
+    try:
+        obj = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, "frame is not JSON, discarded", None, None, None, None
+    if not isinstance(obj, dict):
+        return False, "frame is not a JSON object, discarded", None, None, None, None
+    if obj.get("v") != 1:
+        return False, "bad frame v, discarded", None, None, None, None
+    if obj.get("alg") != ALG:
+        return False, "bad frame alg, discarded", None, None, None, None
+    kind = obj.get("kind")
+    if not isinstance(kind, str) or kind not in INBOUND_KINDS:
+        return False, "bad frame kind, discarded", None, None, None, None
+    mac_b64 = obj.get("mac_b64")
+    body_b64 = obj.get("body_b64")
+    if not isinstance(mac_b64, str) or not isinstance(body_b64, str):
+        return False, "frame missing mac_b64/body_b64, discarded", None, None, None, None
+    mac = b64decode(mac_b64)
+    body = b64decode(body_b64)
+    if mac is None or body is None:
+        return False, "frame base64 invalid, discarded", None, None, None, None
+    from_name: Optional[str] = None
+    if "from" in obj:
+        raw_from = obj["from"]
+        if not valid_from_name(raw_from):
+            return False, "bad frame from, discarded", None, None, None, None
+        from_name = raw_from
+    queued_at: Optional[str] = None
+    if "queued_at" in obj:
+        raw_queued = obj["queued_at"]
+        if not valid_queued_at(raw_queued):
+            return False, "bad frame queued_at, discarded", None, None, None, None
+        if kind not in (KIND_MSG, KIND_RELAYED):
+            return False, "bad frame queued_at, discarded", None, None, None, None
+        if from_name is None:
+            return False, "bad frame queued_at, discarded", None, None, None, None
+        queued_at = raw_queued
+    expected = frame_mac(key, from_name, body, queued_at)
+    if len(mac) != len(expected) or not hmac.compare_digest(mac, expected):
+        return False, "bad MAC, discarded", None, None, None, None
+    frame_sid = obj.get("session_id")
+    if not isinstance(frame_sid, str) or not frame_sid:
+        return False, "bad frame session_id, discarded", None, None, None, None
+    if expect_session_id and frame_sid != expect_session_id:
+        return False, "session_id mismatch, discarded", None, None, None, None
+    if kind == KIND_STATUS:
+        extra = obj.get("status")
+        if extra is not None:
+            try:
+                token = body.decode("utf-8")
+            except UnicodeDecodeError:
+                return False, "bad status, discarded", None, None, None, None
+            if extra != token:
+                return False, "status field mismatch, discarded", None, None, None, None
+        return True, "", KIND_STATUS, body, from_name, None
+    return True, "", kind, body, from_name, queued_at
+
+
+def build_frame(
+    kind: str,
+    body: bytes,
+    key: bytes,
+    session_id: str,
+) -> bytes:
+    """One frame line. session_id is required and always written.
+
+    The CLI's own outbound frames carry no "from" and no queued_at: the MAC
+    is over body.
+    """
+    mac = frame_mac(key, None, body)
+    obj: dict[str, Any] = {
+        "v": 1,
+        "alg": ALG,
+        "kind": kind,
+        "session_id": session_id,
+        "mac_b64": b64encode(mac),
+        "body_b64": b64encode(body),
+    }
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def close_quietly(sock: Optional[socket.socket]) -> None:
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def prepare_conn(conn: socket.socket) -> None:
+    if hasattr(conn, "set_inheritable"):
+        conn.set_inheritable(False)
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    conn.settimeout(None)
+
+
+def send_raw(conn: socket.socket, data: bytes, deadline: float) -> bool:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    try:
+        conn.settimeout(remaining)
+        conn.sendall(data)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            conn.settimeout(None)
+        except OSError:
+            pass
+
+
+def conn_is_idle(conn: socket.socket, buf: bytearray) -> bool:
+    if buf:
+        return False
+    try:
+        ready, _, _ = select.select([conn], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    if not ready:
+        return True
+    try:
+        peeked = conn.recv(1, socket.MSG_PEEK)
+    except OSError:
+        return True
+    return not peeked
+
+
+def emit_status(body: bytes) -> None:
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        text = body.decode("utf-8", "replace")
+    sys.stderr.write(f"# status: {text}\n")
+    try:
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+
+def emit_frame_meta(kind: str, body: bytes, sent: bool = False) -> None:
+    extra = " sent" if sent else ""
+    sys.stderr.write(f"# frame: kind={kind} len={len(body)}{extra}\n")
+    try:
+        sys.stderr.flush()
+    except OSError:
+        pass
+
+
+def emit_stdout(body: bytes) -> None:
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+class _DaemonStop(Exception):
+    """Raised in the background session by its SIGTERM/SIGINT/SIGHUP hooks."""
+
+
+def _daemon_signal(signum: int, frame: Any) -> None:
+    raise _DaemonStop
+
+
+class LogWriter:
+    """Daemon sys.stderr: every diagnostic line gets a local timestamp."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._carry = ""
+
+    def write(self, text: str) -> int:
+        self._carry += text
+        while "\n" in self._carry:
+            line, self._carry = self._carry.split("\n", 1)
+            self._stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+        return len(text)
+
+    def flush(self) -> None:
+        if self._carry:
+            self.write("\n")
+        try:
+            self._stream.flush()
+        except OSError:
+            pass
+
+
+def decode_body(body: bytes) -> str:
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError:
+        return body.decode("utf-8", "replace")
+
+
+def message_text(body: bytes) -> str:
+    """A msg body as the webhook "message": decoded, one trailing \\n off."""
+    text = decode_body(body)
+    return text[:-1] if text.endswith("\n") else text
+
+
+def queued_display(queued_at: str) -> str:
+    """A validated queued_at as "YYYY-MM-DD HH:MM <offset>" (Z as +00:00)."""
+    offset = "+00:00" if queued_at.endswith("Z") else queued_at[19:]
+    return f"{queued_at[:10]} {queued_at[11:16]} {offset}"
+
+
+def format_msg(
+    from_name: Optional[str], body: str, queued_at: Optional[str] = None
+) -> str:
+    """A turn's msg line: the speaker prefix, body as-is (first line only)."""
+    if queued_at:
+        return (
+            f"[{from_name or '?'}, queued {queued_display(queued_at)}] {body}"
+        )
+    return f"[{from_name or '?'}] {body}"
+
+
+
+def classify_delivery(got_relayed: bool, got_ack: bool, got_text: bool) -> str:
+    """Map turn flags to the fixed DELIVERY status word."""
+    if got_relayed:
+        return "relayed"
+    if got_ack or got_text:
+        return "ack"
+    return "unconfirmed"
+
+
+def emit_delivery(status: str, as_json: bool) -> None:
+    """Always print 'DELIVERY <status>'; with --json also print JSON."""
+    line = f"DELIVERY {status}\n"
+    try:
+        emit_stdout(line.encode("utf-8"))
+    except BrokenPipeError:
+        pass
+    if as_json:
+        payload = json.dumps({"delivery": status}, ensure_ascii=False) + "\n"
+        try:
+            emit_stdout(payload.encode("utf-8"))
+        except BrokenPipeError:
+            pass
+
+
+def format_ack(from_name: Optional[str]) -> str:
+    """A turn's ack line: the dialer named in from received the last line(s)."""
+    return f"# ack (by {from_name or '?'})\n"
+
+
+def format_relayed(
+    from_name: Optional[str], name: str, queued_at: Optional[str] = None
+) -> str:
+    """A turn's relayed line: the hand-off to <name>, sent by <from or ?>."""
+    if queued_at:
+        return (
+            f"# relayed: {name} (by {from_name or '?'}, "
+            f"queued {queued_display(queued_at)})\n"
+        )
+    return f"# relayed: {name} (by {from_name or '?'})\n"
+
+
+def state_home() -> Path:
+    return Path(
+        os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+    ).expanduser()
+
+
+def sessions_root() -> Path:
+    return state_home() / "asksoul" / "sessions"
+
+
+def session_dir_for(session_id: str) -> Path:
+    """One dir per session: hash(session_id)[:16], an internal path key only.
+
+    The session id is in meta.json. The hash keeps the unix socket path
+    short and safe.
+    """
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    return sessions_root() / digest
+
+
+def makedirs_private(path: Path) -> None:
+    """mkdir -p, mode 0700 for every directory this call creates."""
+    missing: list[Path] = []
+    cur = path
+    while not cur.exists() and cur.parent != cur:
+        missing.append(cur)
+        cur = cur.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=SESSION_DIR_MODE)
+        except FileExistsError:
+            pass
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def read_session_meta(session_dir: Path) -> Optional[dict[str, Any]]:
+    try:
+        raw = (session_dir / META_NAME).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        meta = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def live_session(session_dir: Path, session_id: str) -> Optional[dict[str, Any]]:
+    """The session's meta when it is live (pid alive and id matches)."""
+    meta = read_session_meta(session_dir)
+    if meta is None or meta.get("id") != session_id:
+        return None
+    pid = meta.get("pid")
+    if not isinstance(pid, int) or not pid_alive(pid):
+        return None
+    return meta
+
+
+def session_state(session_dir: Path, session_id: str) -> str:
+    """What -s ID finds: live, ended (lingering unread frames) or stale."""
+    meta = live_session(session_dir, session_id)
+    if meta is None:
+        return STATE_STALE
+    if isinstance(meta.get("ended"), str):
+        return STATE_ENDED
+    return STATE_LIVE
+
+
+def live_daemon_pid(session_dir: Path, session_id: str) -> Optional[int]:
+    """meta.json's pid while it is this session's and still alive."""
+    meta = read_session_meta(session_dir)
+    if meta is None or meta.get("id") != session_id:
+        return None
+    pid = meta.get("pid")
+    if not isinstance(pid, int) or not pid_alive(pid):
+        return None
+    return pid
+
+
+def write_session_meta(session_dir: Path, meta: dict[str, Any]) -> None:
+    path = session_dir / META_NAME
+    path.write_text(json.dumps(meta, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, SESSION_FILE_MODE)
+    except OSError:
+        pass
+
+
+def caller_command(ppid: int) -> str:
+    """`ps -o command= -p PPID`, truncated to 200 chars, best effort."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(ppid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout.strip()[:CALLER_CMD_CHARS]
+
+
+def build_session_meta(
+    session_id: str,
+    who: str,
+    source: str,
+    host: str,
+    port: int,
+    timeout_sec: int,
+    message: str,
+) -> dict[str, Any]:
+    """meta.json for a new session. The daemon fills in its own pid."""
+    ppid = os.getppid()
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    return {
+        "id": session_id,
+        "pid": 0,
+        "created": time.time(),
+        "who": who,
+        "source": source,
+        "host": host,
+        "port": port,
+        "timeout_sec": timeout_sec,
+        "message_head": message[:MESSAGE_HEAD_CHARS],
+        "caller": {"ppid": ppid, "cwd": cwd, "cmd": caller_command(ppid)},
+    }
+
+
+def format_age(seconds: float) -> str:
+    total = int(max(0.0, seconds))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    mins, secs = divmod(rest, 60)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{mins}m"
+    if mins:
+        return f"{mins}m{secs}s"
+    return f"{secs}s"
+
+
+def connect_ctl(session_dir: Path, wait: float = 0.0) -> Optional[socket.socket]:
+    """Connect to the session's control socket, retrying for wait seconds."""
+    path = session_dir / CTL_NAME
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            conn.connect(str(path))
+        except OSError:
+            close_quietly(conn)
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(CTL_RETRY_SEC)
+            continue
+        prepare_conn(conn)
+        return conn
+
+
+def connect_session(
+    session_dir: Path, session_id: str, wait: float
+) -> Optional[socket.socket]:
+    """Wait for a live session and its control socket (the session process)."""
+    deadline = time.monotonic() + max(0.0, wait)
+    while True:
+        if live_session(session_dir, session_id) is not None:
+            conn = connect_ctl(session_dir)
+            if conn is not None:
+                return conn
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(CTL_RETRY_SEC)
+
+
+def send_event(conn: socket.socket, obj: dict[str, Any]) -> bool:
+    """One JSON line on the control socket."""
+    data = (
+        json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+    return send_raw(conn, data, time.monotonic() + EVENT_SEND_TIMEOUT)
+
+
+def read_json_line(conn: socket.socket, timeout: float) -> Optional[dict[str, Any]]:
+    """Read one JSON object line from the control socket, or None."""
+    buf = bytearray()
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            ready, _, _ = select.select([conn], [], [], remaining)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        try:
+            chunk = conn.recv(4096)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf.extend(chunk)
+        lines = pop_json_lines(buf)
+        if not lines:
+            continue
+        try:
+            obj = json.loads(lines[0].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return obj if isinstance(obj, dict) else None
+
+
+def bind_ctl(session_dir: Path) -> socket.socket:
+    """The AF_UNIX stream socket the daemon serves clients on (mode 0600)."""
+    path = session_dir / CTL_NAME
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        if hasattr(sock, "set_inheritable"):
+            sock.set_inheritable(False)
+        sock.bind(str(path))
+        os.chmod(path, SESSION_FILE_MODE)
+        sock.listen(8)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+_DAEMON_PROCS: list[subprocess.Popen] = []
+
+
+def spawn_daemon(
+    session_dir: Path,
+    meta: dict[str, Any],
+    listener: socket.socket,
+    key: bytes,
+    allow: set[str],
+    timeout_sec: int,
+    session_id: str,
+    who: str,
+    source: str,
+    reply_meta: dict[str, Any],
+    url: str,
+    sender_key: str,
+) -> None:
+    """Exec the background session on a fresh interpreter; this process returns.
+
+    Never fork: the parent has already run getaddrinfo for the webhook POST,
+    and a forked copy inherits that initialized network state — on macOS the
+    daemon's next getaddrinfo (its -s rewake POST) then crashes inside
+    Network.framework. The exec'd child gets the session state as one JSON
+    line on stdin (secrets travel only on this pipe, never argv/env/disk)
+    and the bound listener as an inherited fd.
+    """
+    data = (
+        json.dumps(
+            {
+                "session_dir": str(session_dir),
+                "meta": meta,
+                "key": b64encode(key),
+                "allow": sorted(allow),
+                "timeout_sec": timeout_sec,
+                "session_id": session_id,
+                "who": who,
+                "source": source,
+                "reply_meta": reply_meta,
+                "url": url,
+                "sender_key": sender_key,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    env = os.environ.copy()
+    env[DAEMON_FD_ENV] = str(listener.fileno())
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        pass_fds=(listener.fileno(),),
+        start_new_session=True,
+        env=env,
+    )
+    if proc.stdin is not None:
+        try:
+            proc.stdin.write(data)
+        except OSError:
+            pass
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+    # Keep the Popen object and never wait: the child is the long-lived
+    # daemon, not a job of ours (the parent exits after the first turn).
+    _DAEMON_PROCS.append(proc)
+
+
+def log_daemon_crash(session_dir: Optional[Path], text: str) -> None:
+    """Best effort: an early daemon traceback lands in the session log."""
+    if session_dir is None or not session_dir.is_dir():
+        return
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(session_dir / LOG_NAME, "a", encoding="utf-8") as out:
+            out.write(f"{stamp} daemon init failed\n")
+            for line in text.rstrip("\n").splitlines():
+                out.write(f"{stamp} {line}\n")
+        os.chmod(session_dir / LOG_NAME, SESSION_FILE_MODE)
+    except OSError:
+        pass
+
+
+def daemon_entry() -> int:
+    """ASKSOUL_DAEMON_FD: this process is the exec'd background session.
+
+    Internal only (spawn_daemon sets the marker): one JSON object on stdin
+    carries the session state, the inherited fd is the bound listener.
+    """
+    fd_raw = os.environ.pop(DAEMON_FD_ENV, "")
+    session_dir: Optional[Path] = None
+    try:
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("daemon init is not a JSON object")
+        session_dir = Path(str(data["session_dir"]))
+        key = b64decode(str(data["key"]))
+        if key is None:
+            raise ValueError("daemon init key is not base64")
+        # family/type come from the inherited fd itself.
+        listener = socket.socket(fileno=int(fd_raw))
+        run_daemon(
+            session_dir,
+            data["meta"],
+            listener,
+            key,
+            set(data["allow"]),
+            int(data["timeout_sec"]),
+            str(data["session_id"]),
+            str(data["who"]),
+            str(data["source"]),
+            data["reply_meta"],
+            str(data["url"]),
+            str(data["sender_key"]),
+        )
+    except BaseException:
+        # run_daemon logs its own crashes; this is the init path before it.
+        log_daemon_crash(session_dir, traceback.format_exc())
+        return EXIT_SETUP
+    return EXIT_OK
+
+
+def run_daemon(
+    session_dir: Path,
+    meta: dict[str, Any],
+    listener: socket.socket,
+    key: bytes,
+    allow: set[str],
+    timeout_sec: int,
+    session_id: str,
+    who: str,
+    source: str,
+    reply_meta: dict[str, Any],
+    url: str,
+    sender_key: str,
+) -> None:
+    """The background session: the bot TCP side plus the control socket."""
+    deadline = time.monotonic() + timeout_sec
+    current: Optional[socket.socket] = None
+    bot_buf = bytearray()
+    events: deque[dict[str, Any]] = deque()
+    client: Optional[socket.socket] = None
+    client_buf = bytearray()
+    conn: Optional[socket.socket] = None
+    conn_buf = bytearray()
+    bad_mac_streak = 0
+    finished = False
+    ctl: Optional[socket.socket] = None
+    log_out: Optional[Any] = None
+
+    def send_deadline() -> float:
+        return time.monotonic() + EVENT_SEND_TIMEOUT
+
+    def drop_current() -> None:
+        nonlocal current
+        close_quietly(current)
+        current = None
+        bot_buf.clear()
+
+    def emit_event(obj: dict[str, Any]) -> None:
+        """Deliver to the attached client, else keep it for the next one."""
+        nonlocal client
+        if client is not None:
+            if send_event(client, obj):
+                return
+            eprint("ctl client write failed, dropped")
+            close_quietly(client)
+            client = None
+        events.append(obj)
+
+    def flush_events() -> None:
+        nonlocal client
+        while client is not None and events:
+            if not send_event(client, events[0]):
+                eprint("ctl client write failed, dropped")
+                close_quietly(client)
+                client = None
+                return
+            events.popleft()
+
+    def add_client() -> None:
+        """The pending connection takes the seat; any older one is replaced."""
+        nonlocal client, conn
+        if conn is None:
+            return
+        if client is not None:
+            send_event(client, {"ev": "end", "reason": END_REPLACED})
+            eprint("ctl client replaced")
+            close_quietly(client)
+            client_buf.clear()
+        client = conn
+        conn = None
+        client_buf.extend(conn_buf)
+        conn_buf.clear()
+        flush_events()
+
+    def wake_bot(message: str) -> Optional[WebhookError]:
+        """Re-POST the webhook: same session, the user's next line.
+
+        Returns None on success, else the WebhookError (its detail names
+        the attempts made and the last error).
+        """
+        if os.environ.get("ASKSOUL_NO_WEBHOOK") == "1":
+            out: dict[str, Any] = {
+                "no_webhook_rewake": True,
+                "message": message,
+                "session_id": session_id,
+                "port": meta["port"],
+            }
+            sys.stderr.write(json.dumps(out, ensure_ascii=False) + "\n")
+            sys.stderr.flush()
+            return None
+        payload = build_payload(message, reply_meta, session_id, source, who)
+        try:
+            post_webhook(url, sender_key, payload)
+        except WebhookError as exc:
+            eprint(f"rewake webhook failed ({exc.detail})")
+            return exc
+        return None
+
+    def user_msg(text: str) -> None:
+        nonlocal deadline
+        deadline = time.monotonic() + timeout_sec
+        body = text.encode("utf-8")
+        if current is not None:
+            data = build_frame(KIND_MSG, body, key, session_id)
+            if send_raw(current, data, send_deadline()):
+                emit_frame_meta(KIND_MSG, body, sent=True)
+                emit_event({"ev": "sent"})
+                return
+            eprint("send failed, waiting for reconnect")
+            drop_current()
+        failure = wake_bot(message_text(body))
+        if failure is None:
+            emit_event({"ev": "rewoke"})
+            return
+        emit_event(
+            {
+                "ev": "webhook_failed",
+                "attempts": failure.attempts,
+                "detail": failure.detail,
+            }
+        )
+
+    def info_event() -> dict[str, Any]:
+        left = deadline - time.monotonic()
+        return {
+            "ev": "info",
+            "id": session_id,
+            "pid": os.getpid(),
+            "idle_left": max(0, int(round(left))),
+            "timeout_sec": timeout_sec,
+            "who": who,
+            "host": meta["host"],
+            "port": meta["port"],
+            "attached": client is not None,
+            "bot": current is not None,
+        }
+
+    def serve_ctl_line(line: bytes, source: socket.socket) -> Optional[str]:
+        """One control line from a client; the end reason if the session ends."""
+        nonlocal conn, client, client_buf
+        if not line.strip():
+            return None
+        try:
+            obj = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            eprint("ctl line is not JSON, dropped")
+            return None
+        if not isinstance(obj, dict):
+            eprint("ctl line is not a JSON object, dropped")
+            return None
+        op = obj.get("op")
+        if op == OP_INFO:
+            if not send_event(source, info_event()):
+                eprint("ctl info reply failed")
+                if source is client:
+                    close_quietly(client)
+                    client = None
+                    client_buf.clear()
+            if source is conn:
+                close_quietly(conn)
+                conn = None
+                conn_buf.clear()
+            return None
+        if source is conn:
+            add_client()
+        if op == OP_ATTACH:
+            return None
+        if op == OP_MSG:
+            body = obj.get("body")
+            if not isinstance(body, str):
+                eprint("ctl msg has no body, ignored")
+                return None
+            user_msg(body)
+            return None
+        if op == OP_CLOSE:
+            if current is not None:
+                data = build_frame(KIND_CLOSE, b"", key, session_id)
+                if send_raw(current, data, send_deadline()):
+                    emit_frame_meta(KIND_CLOSE, b"", sent=True)
+                drop_current()
+            return END_LOCAL_CLOSE
+        eprint(f"ctl op {op!r} ignored")
+        return None
+
+    def serve_inbound(line: bytes) -> Optional[str]:
+        """One frame from the bot. Returns an end reason when it ends us."""
+        nonlocal bad_mac_streak, deadline
+        ok, reason, kind, body, from_name, queued_at = verify_frame(
+            line, key, session_id
+        )
+        if not ok or kind is None or body is None:
+            eprint(reason)
+            if reason.startswith("bad MAC"):
+                bad_mac_streak += 1
+                if bad_mac_streak == 1:
+                    eprint(
+                        "HMAC failed on this run's key (likely stale session "
+                        "crypto). Start a new session."
+                    )
+                if bad_mac_streak >= BAD_MAC_ABORT_AFTER:
+                    eprint(
+                        f"aborting after {BAD_MAC_ABORT_AFTER} consecutive "
+                        "bad MACs"
+                    )
+                    return END_BAD_MAC
+            return None
+        bad_mac_streak = 0
+        deadline = time.monotonic() + timeout_sec
+        emit_frame_meta(kind, body)
+        if kind == KIND_STATUS:
+            emit_status(body)
+            emit_event({"ev": "status", "body": decode_body(body)})
+            return None
+        if kind == KIND_MSG:
+            emit_event(
+                {
+                    "ev": "msg",
+                    "body": decode_body(body),
+                    "from": from_name or None,
+                    "queued_at": queued_at or None,
+                }
+            )
+            return None
+        if kind == KIND_RELAYED:
+            emit_event(
+                {
+                    "ev": "relayed",
+                    "name": decode_body(body).strip(),
+                    "from": from_name or None,
+                    "queued_at": queued_at or None,
+                }
+            )
+            return None
+        if kind == KIND_ACK:
+            emit_event({"ev": "ack", "from": from_name or None})
+            return None
+        if kind == KIND_CLOSE:
+            text = decode_body(body)
+            if text:
+                eprint(f"close {text}")
+            emit_event({"ev": "close", "reason": text})
+            return END_CLOSED
+        return None
+
+    def wait_first_client() -> None:
+        """Let the opening caller attach before any bot frame is read.
+
+        The default action prints the webhook JSON before the daemon
+        starts, so a bot may be dialing in and talking before that
+        foreground is back as a client. Holding the bot side back for a
+        moment is what lets the first turn see a close or a bad-MAC abort
+        instead of finding the session gone.
+        """
+        nonlocal conn
+        grace = time.monotonic() + DAEMON_ATTACH_GRACE
+        while client is None and conn is None and ctl is not None:
+            wait = min(grace, deadline) - time.monotonic()
+            if wait <= 0:
+                return
+            try:
+                ready, _, _ = select.select([ctl, listener], [], [], wait)
+            except (OSError, ValueError):
+                return
+            if not ready:
+                return
+            if ctl in ready:
+                try:
+                    new_conn, _ = ctl.accept()
+                except OSError:
+                    return
+                if new_conn is not None:
+                    prepare_conn(new_conn)
+                    conn = new_conn
+                return
+            # only the bot is ready: keep it queued until the client sits
+
+    def daemon_loop() -> str:
+        """Serve the bot and the client until the session ends."""
+        nonlocal current, conn, client
+        wait_first_client()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                eprint("idle timeout, no close")
+                return END_TIMEOUT
+            rlist: list[Any] = [listener]
+            if ctl is not None:
+                rlist.append(ctl)
+            if current is not None:
+                rlist.append(current)
+            if client is not None:
+                rlist.append(client)
+            if conn is not None:
+                rlist.append(conn)
+            try:
+                ready, _, _ = select.select(rlist, [], [], remaining)
+            except (OSError, ValueError):
+                eprint("select failed")
+                return END_LOCAL_CLOSE
+            if not ready:
+                eprint("idle timeout, no close")
+                return END_TIMEOUT
+
+            # One recv per socket per select round: promoting the pending
+            # connection to client must not make us read the same socket
+            # twice off one stale readiness.
+            bot_conn, pending_conn, client_conn = current, conn, client
+
+            if ctl is not None and ctl in ready:
+                try:
+                    new_conn, _ = ctl.accept()
+                except OSError:
+                    new_conn = None
+                if new_conn is not None:
+                    if conn is not None:
+                        eprint("ctl connection replaced")
+                        close_quietly(conn)
+                        conn_buf.clear()
+                    prepare_conn(new_conn)
+                    conn = new_conn
+
+            if pending_conn is not None and pending_conn in ready:
+                try:
+                    chunk = pending_conn.recv(4096)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    if pending_conn is conn:
+                        close_quietly(conn)
+                        conn = None
+                        conn_buf.clear()
+                else:
+                    conn_buf.extend(chunk)
+                    for line in pop_json_lines(conn_buf):
+                        end = serve_ctl_line(line, pending_conn)
+                        if end is not None:
+                            return end
+
+            if client_conn is not None and client_conn in ready:
+                try:
+                    chunk = client_conn.recv(4096)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    if client_conn is client:
+                        eprint("ctl client disconnected")
+                        close_quietly(client)
+                        client = None
+                        client_buf.clear()
+                else:
+                    client_buf.extend(chunk)
+                    for line in pop_json_lines(client_buf):
+                        end = serve_ctl_line(line, client_conn)
+                        if end is not None:
+                            return end
+
+            if listener in ready:
+                try:
+                    bot, addr = listener.accept()
+                except OSError:
+                    bot = None
+                    addr = None
+                if bot is not None:
+                    peer_ip = addr[0] if addr else ""
+                    if not peer_allowed(peer_ip, allow):
+                        eprint(f"rejected peer {peer_ip}")
+                        close_quietly(bot)
+                    elif current is not None and not conn_is_idle(current, bot_buf):
+                        eprint(f"rejected concurrent peer {peer_ip}")
+                        close_quietly(bot)
+                    else:
+                        if current is not None:
+                            eprint(f"peer replaced {peer_ip}")
+                            drop_current()
+                        prepare_conn(bot)
+                        current = bot
+
+            if bot_conn is not None and bot_conn in ready and bot_conn is current:
+                try:
+                    chunk = bot_conn.recv(4096)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    if bot_buf:
+                        eprint("incomplete frame, discarded")
+                    drop_current()
+                else:
+                    bot_buf.extend(chunk)
+                    for line in pop_json_lines(bot_buf):
+                        end = serve_inbound(line)
+                        if end is not None:
+                            return end
+
+    def finish(reason: str) -> None:
+        nonlocal finished, client, conn, current, ctl
+        if finished:
+            return
+        finished = True
+        if client is not None:
+            send_event(client, {"ev": "end", "reason": reason})
+        for sock in (client, conn, current, ctl, listener):
+            close_quietly(sock)
+        client = None
+        conn = None
+        current = None
+        ctl = None
+        if log_out is not None:
+            try:
+                log_out.close()
+            except OSError:
+                pass
+        shutil.rmtree(session_dir, ignore_errors=True)
+
+    def setup() -> socket.socket:
+        nonlocal log_out
+        makedirs_private(session_dir)
+        log_path = session_dir / LOG_NAME
+        log_out = open(log_path, "a", encoding="utf-8")
+        try:
+            os.chmod(log_path, SESSION_FILE_MODE)
+        except OSError:
+            pass
+        sys.stderr = LogWriter(log_out)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, _daemon_signal)
+        meta["pid"] = os.getpid()
+        write_session_meta(session_dir, meta)
+        server = bind_ctl(session_dir)
+        eprint(
+            f"daemon pid {os.getpid()} session {session_id} listening "
+            f"{meta['host']}:{meta['port']} idle timeout {timeout_sec}s"
+        )
+        return server
+
+    def linger(reason: str) -> None:
+        """The bot is gone but its last frames are unread: keep them up to -t.
+
+        Only the control socket stays open. The next client gets the unread
+        events and then the end event; info answers without taking the seat.
+        """
+        nonlocal current, client, conn
+        drop_current()
+        close_quietly(listener)
+        meta["ended"] = reason
+        write_session_meta(session_dir, meta)
+        eprint(f"session ended ({reason}); keeping unread frames up to {timeout_sec}s")
+        # A client may already have been accepted but not promoted when the
+        # end frame arrived in the same select round. Give it the queued
+        # events now instead of waiting for a second connection that the
+        # caller will never make.
+        if conn is not None:
+            if client is not None:
+                close_quietly(client)
+                client_buf.clear()
+            client = conn
+            conn = None
+            client_buf.extend(conn_buf)
+            conn_buf.clear()
+            flush_events()
+        until = time.monotonic() + timeout_sec
+        while client is None and ctl is not None:
+            left = until - time.monotonic()
+            if left <= 0:
+                eprint("unread frames expired")
+                return
+            try:
+                ready, _, _ = select.select([ctl], [], [], left)
+            except (OSError, ValueError):
+                return
+            if not ready:
+                eprint("unread frames expired")
+                return
+            try:
+                new_conn, _ = ctl.accept()
+            except OSError:
+                continue
+            prepare_conn(new_conn)
+            obj = read_json_line(new_conn, CTL_REPLY_TIMEOUT) or {}
+            if obj.get("op") == OP_INFO:
+                info = info_event()
+                info["ended"] = reason
+                send_event(new_conn, info)
+                close_quietly(new_conn)
+                continue
+            if obj.get("op") == OP_MSG:
+                eprint("ctl msg after session end, not sent")
+            client = new_conn
+            flush_events()
+
+    reason = END_LOCAL_CLOSE
+    try:
+        ctl = setup()
+        reason = daemon_loop()
+        if (
+            reason in (END_CLOSED, END_TIMEOUT, END_BAD_MAC)
+            and client is None
+            and any(e.get("ev") != "status" for e in events)
+        ):
+            linger(reason)
+    except _DaemonStop:
+        eprint("stopped by signal, ending session")
+    except BaseException:
+        traceback.print_exc()
+    finally:
+        finish(reason)
+
+
+def query_idle_left(session_dir: Path, meta: dict[str, Any]) -> int:
+    """Idle seconds left, asked of the live daemon; -t if it cannot answer."""
+    conn = connect_ctl(session_dir)
+    if conn is not None:
+        try:
+            if send_event(conn, {"op": OP_INFO}):
+                obj = read_json_line(conn, CTL_REPLY_TIMEOUT)
+                if obj is not None:
+                    left = obj.get("idle_left")
+                    if isinstance(left, (int, float)):
+                        return max(0, int(left))
+        finally:
+            close_quietly(conn)
+    timeout_sec = meta.get("timeout_sec")
+    return int(timeout_sec) if isinstance(timeout_sec, int) else 0
+
+
+def list_sessions() -> int:
+    """ls: the header row first (always), then one tab separated line per
+    live session; stale dirs removed."""
+    sys.stdout.write("\t".join(LS_COLUMNS) + "\n")
+    root = sessions_root()
+    if not root.is_dir():
+        sys.stdout.flush()
+        return EXIT_OK
+    live: list[tuple[str, Path, dict[str, Any]]] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        meta = read_session_meta(entry)
+        if meta is None:
+            try:
+                if time.time() - entry.stat().st_mtime < 10:
+                    continue  # a daemon still writing its meta
+            except OSError:
+                continue
+        session_id = meta.get("id") if meta is not None else None
+        pid = meta.get("pid") if meta is not None else None
+        if (
+            not isinstance(session_id, str)
+            or not isinstance(pid, int)
+            or not pid_alive(pid)
+        ):
+            shutil.rmtree(entry, ignore_errors=True)
+            continue
+        live.append((session_id, entry, meta))
+    for session_id, entry, meta in sorted(live, key=lambda row: row[0]):
+        created = meta.get("created")
+        age = (
+            format_age(time.time() - created)
+            if isinstance(created, (int, float))
+            else "?"
+        )
+        caller = meta.get("caller")
+        cwd = ""
+        if isinstance(caller, dict) and isinstance(caller.get("cwd"), str):
+            cwd = caller["cwd"]
+        head = ""
+        if isinstance(meta.get("message_head"), str):
+            head = (
+                meta["message_head"][:LIST_HEAD_CHARS]
+                .replace("\n", " ")
+                .replace("\r", " ")
+            )
+        who = meta.get("who") if isinstance(meta.get("who"), str) else ""
+        if isinstance(meta.get("ended"), str):
+            state = f"ended:{meta['ended']}, unread kept"
+        else:
+            state = f"open, idle ends in {query_idle_left(entry, meta)}s"
+        sys.stdout.write(
+            "\t".join(
+                [
+                    session_id,
+                    str(meta["pid"]),
+                    age,
+                    state,
+                    who,
+                    cwd,
+                    head,
+                ]
+            )
+            + "\n"
+        )
+    sys.stdout.flush()
+    return EXIT_OK
+
+
+def close_session(session_dir: Path, session_id: str) -> int:
+    """close ID: the daemon sends kind=close, drops the dir, exits."""
+    conn = connect_session(session_dir, session_id, 0.0)
+    if conn is None:
+        eprint(f"no open session {session_id}")
+        return EXIT_USAGE
+    reason = END_LOCAL_CLOSE
+    try:
+        if send_event(conn, {"op": OP_CLOSE}):
+            obj = read_json_line(conn, CTL_REPLY_TIMEOUT)
+            if obj is not None and obj.get("ev") == "end":
+                reason = str(obj.get("reason") or END_LOCAL_CLOSE)
+    finally:
+        close_quietly(conn)
+    eprint(f"session {session_id} ended ({reason})")
+    return EXIT_OK
+
+
+def run_turn(
+    session_dir: Path,
+    session_id: str,
+    message: Optional[str],
+    wait_sec: int,
+    connect_wait: float = 0.0,
+    as_json: bool = False,
+    bot_name: str = DEFAULT_BOT_NAME,
+) -> int:
+    """One background-session turn: send, stream the events, print the turn."""
+    conn = connect_session(session_dir, session_id, connect_wait)
+    if conn is None:
+        eprint(f"no open session {session_id}")
+        return EXIT_USAGE
+    got_text = False
+    got_relayed = False
+    got_ack = False
+    end_reason: Optional[str] = None
+    close_reason: Optional[str] = None
+    try:
+        event: dict[str, Any] = {"op": OP_ATTACH}
+        if message is not None:
+            event = {"op": OP_MSG, "body": message + "\n"}
+        if not send_event(conn, event):
+            eprint(f"no open session {session_id}")
+            return EXIT_USAGE
+        # --wait counts from delivery: a line still being re-POSTed (retries
+        # take up to ~40 s) must report its own outcome to this call.
+        wait_deadline: Optional[float] = None
+        if message is None:
+            wait_deadline = time.monotonic() + wait_sec
+        delivery_deadline = time.monotonic() + DELIVERY_WAIT_SEC
+        settle_at: Optional[float] = None
+        buf = bytearray()
+        while end_reason is None and close_reason is None:
+            limit = wait_deadline if wait_deadline is not None else delivery_deadline
+            if settle_at is not None and settle_at < limit:
+                limit = settle_at
+            remaining = limit - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                ready, _, _ = select.select([conn], [], [], remaining)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                break
+            try:
+                chunk = conn.recv(65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                eprint(f"no open session {session_id}")
+                return EXIT_USAGE
+            buf.extend(chunk)
+            for line in pop_json_lines(buf):
+                try:
+                    obj = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                ev = obj.get("ev")
+                if ev == "status":
+                    body = obj.get("body")
+                    if isinstance(body, str):
+                        emit_status(body.encode("utf-8"))
+                elif ev == "msg":
+                    body = obj.get("body")
+                    if isinstance(body, str):
+                        from_name = obj.get("from")
+                        if not isinstance(from_name, str):
+                            from_name = None
+                        queued_at = obj.get("queued_at")
+                        if not isinstance(queued_at, str):
+                            queued_at = None
+                        try:
+                            emit_stdout(
+                                format_msg(from_name, body, queued_at).encode(
+                                    "utf-8"
+                                )
+                            )
+                        except BrokenPipeError:
+                            eprint("stdout closed")
+                            return EXIT_USAGE
+                        got_text = True
+                elif ev == "relayed":
+                    name = obj.get("name")
+                    if isinstance(name, str):
+                        from_name = obj.get("from")
+                        if not isinstance(from_name, str):
+                            from_name = None
+                        queued_at = obj.get("queued_at")
+                        if not isinstance(queued_at, str):
+                            queued_at = None
+                        try:
+                            emit_stdout(
+                                format_relayed(from_name, name, queued_at).encode(
+                                    "utf-8"
+                                )
+                            )
+                        except BrokenPipeError:
+                            pass
+                        got_relayed = True
+                elif ev == "ack":
+                    from_name = obj.get("from")
+                    if not isinstance(from_name, str):
+                        from_name = None
+                    try:
+                        emit_stdout(format_ack(from_name).encode("utf-8"))
+                    except BrokenPipeError:
+                        eprint("stdout closed")
+                        return EXIT_USAGE
+                    got_ack = True
+                elif ev == "close":
+                    close_reason = str(obj.get("reason") or "")
+                    break
+                elif ev == "end":
+                    end_reason = str(obj.get("reason") or "")
+                    break
+                elif ev in ("sent", "rewoke"):
+                    eprint("sent")
+                    if wait_deadline is None:
+                        wait_deadline = time.monotonic() + wait_sec
+                elif ev == "webhook_failed":
+                    detail = obj.get("detail")
+                    if not isinstance(detail, str) or not detail:
+                        detail = "unknown error"
+                    eprint(
+                        f"could not reach {bot_name}: webhook failed ({detail}); "
+                        "the line was not delivered and is not kept, resend "
+                        "it yourself"
+                    )
+                    return EXIT_WEBHOOK
+            if (
+                end_reason is None
+                and close_reason is None
+                and (got_text or got_relayed or got_ack)
+            ):
+                settle_at = time.monotonic() + SETTLE_SEC
+    finally:
+        close_quietly(conn)
+    if end_reason is None and close_reason is not None:
+        end_reason = END_CLOSED
+    if end_reason is None:
+        if got_relayed:
+            code = EXIT_RELAYED
+        elif got_text:
+            code = EXIT_OK
+        elif got_ack:
+            code = EXIT_ACKED
+        else:
+            code = EXIT_WAIT
+            emit_stdout(
+                f"# nothing yet (exit 8); wait {session_id} keeps waiting\n"
+                .encode("utf-8")
+            )
+        emit_delivery(
+            classify_delivery(got_relayed, got_ack, got_text), as_json
+        )
+        return code
+    code = END_CODES.get(end_reason, EXIT_USAGE)
+    if got_relayed and code == EXIT_OK:
+        code = EXIT_RELAYED
+    if (
+        got_ack
+        and not got_text
+        and not got_relayed
+        and code == EXIT_OK
+    ):
+        code = EXIT_ACKED
+    eprint(f"session {session_id} ended ({end_reason})")
+    if code != EXIT_WEBHOOK:
+        emit_delivery(
+            classify_delivery(got_relayed, got_ack, got_text), as_json
+        )
+    return code
+
+
+def stop_old_daemon(session_dir: Path, session_id: str) -> None:
+    """After a drain, wait for that daemon to go away and remove its dir.
+
+    SIGTERM only while meta.json still names this session's live pid, so
+    we never signal a pid the dir no longer owns.
+    """
+    pid = live_daemon_pid(session_dir, session_id)
+    deadline = time.monotonic() + OLD_DAEMON_STOP_WAIT
+    while pid is not None and time.monotonic() < deadline:
+        time.sleep(PID_POLL_SEC)
+        pid = live_daemon_pid(session_dir, session_id)
+    if pid is None:
+        return
+    eprint(f"session {session_id} daemon pid {pid} did not stop; SIGTERM")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + OLD_DAEMON_STOP_WAIT
+    while time.monotonic() < deadline:
+        if live_daemon_pid(session_dir, session_id) is None:
+            return
+        time.sleep(PID_POLL_SEC)
+
+
+def open_under_id(session_dir: Path, session_id: str) -> None:
+    """Talk on an id that is not live: drain a lingering end, note old state.
+
+    A lingering ended session is drained first (its unread frames go to
+    stdout) so reopening the listener under the same id loses nothing. A
+    brand-new id gets no note: there was no state here to replace.
+    """
+    state = session_state(session_dir, session_id)
+    if state == STATE_ENDED:
+        meta = read_session_meta(session_dir) or {}
+        reason = meta.get("ended")
+        if not isinstance(reason, str):
+            reason = "?"
+        eprint(
+            f"session {session_id} had ended ({reason}); unread frames "
+            "follow, then the listener reopens under the same id"
+        )
+        run_turn(session_dir, session_id, None, ENDED_DRAIN_WAIT_SEC)
+        stop_old_daemon(session_dir, session_id)
+    if state == STATE_ENDED or session_dir.exists():
+        eprint(
+            f"session {session_id} had prior state; reopening the listener "
+            "under the same id"
+        )
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # type: ignore[override]
+        eprint(message)
+        eprint('try: asksoul -h')
+        raise SystemExit(EXIT_USAGE)
+
+
+def usage_fail(message: str) -> NoReturn:
+    """The _Parser error style, for the checks argparse cannot do."""
+    eprint(message)
+    eprint('try: asksoul -h')
+    raise SystemExit(EXIT_USAGE)
+
+
+def print_version() -> NoReturn:
+    """--version: like -h, before subcommand parsing; exits 0."""
+    sys.stdout.write(f"asksoul {VERSION}\n")
+    raise SystemExit(EXIT_OK)
+
+
+def print_help(who_arg: Optional[str] = None) -> NoReturn:
+    """Main help; -h, no args and a subcommand's -h all end here."""
+    who, source, bot_name = peek_config()
+    if who_arg is not None:
+        try:
+            who = _clean_ident(who_arg, "WHO", MAX_WHO_CHARS)
+        except UsageError as exc:
+            usage_fail(str(exc))
+    sys.stdout.write(render_help(who, source, bot_name))
+    raise SystemExit(EXIT_OK)
+
+
+def check_session_id(session_id: str) -> None:
+    """1..128 chars of A-Za-z0-9._:-, starting with a letter or digit."""
+    if not SESSION_ID_RE.match(session_id):
+        usage_fail(
+            "session id must be 1..128 of A-Z a-z 0-9 . _ : -, "
+            "starting with a letter or digit"
+        )
+
+
+def parse_wait_sec(raw: Optional[str]) -> int:
+    if raw is None:
+        return DEFAULT_WAIT_SEC
+    try:
+        wait_sec = int(raw)
+    except (TypeError, ValueError):
+        usage_fail("--wait must be an integer number of seconds")
+    if wait_sec < MIN_WAIT_SEC or wait_sec > MAX_WAIT_SEC:
+        usage_fail(f"--wait must be {MIN_WAIT_SEC}..{MAX_WAIT_SEC}")
+    return wait_sec
+
+
+def parse_timeout_sec(raw: Optional[str]) -> int:
+    if raw is None:
+        return DEFAULT_TIMEOUT_SEC
+    try:
+        timeout_sec = int(raw)
+    except (TypeError, ValueError):
+        usage_fail("-t must be an integer number of seconds")
+    if timeout_sec < 1 or timeout_sec > MAX_TIMEOUT_SEC:
+        usage_fail(f"-t must be 1..{MAX_TIMEOUT_SEC}")
+    return timeout_sec
+
+
+def new_parser() -> _Parser:
+    """One parser shape for every command; usage is the main help's block."""
+    return _Parser(
+        prog="asksoul",
+        add_help=False,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage=USAGE,
+    )
+
+
+def _toml_quote(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _prompt(text: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        value = input(f"{text}{suffix}: ").strip()
+    except EOFError:
+        return default
+    return value or default
+
+
+def _prompt_secret() -> str:
+    if sys.stdin.isatty():
+        try:
+            return getpass.getpass("Webhook secret: ").strip()
+        except EOFError:
+            return ""
+    try:
+        return sys.stdin.readline().strip()
+    except EOFError:
+        return ""
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write a file mode 0600, creating parent dirs mode 0700."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(text)
+    finally:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def parse_init(rest: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="asksoul init",
+        description="Write ~/.config/asksoul/config.toml (mode 0600).",
+    )
+    parser.add_argument("--webhook-url", metavar="URL")
+    parser.add_argument("--bot-name", metavar="NAME", default=None)
+    secret_group = parser.add_mutually_exclusive_group()
+    secret_group.add_argument(
+        "--secret-cmd", metavar="CMD", help="shell command that prints the secret"
+    )
+    secret_group.add_argument(
+        "--secret-stdin",
+        action="store_true",
+        help="read the secret from stdin and write ~/.config/asksoul/secret",
+    )
+    parser.add_argument(
+        "--accept",
+        action="append",
+        default=[],
+        metavar="HOST[,HOST...]",
+        help="allowed dial-back IPs/hostnames (repeatable, comma separated)",
+    )
+    parser.add_argument("--accept-ssh-host", metavar="HOST", default=None)
+    parser.add_argument("--who", metavar="WHO", default=None)
+    parser.add_argument("--bind", metavar="IP", default=None)
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="never prompt; missing required values are an error",
+    )
+    parser.add_argument("--force", action="store_true", help="overwrite an existing config")
+    args = parser.parse_args(rest)
+    return argparse.Namespace(cmd=CMD_INIT, **vars(args))
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    path = config_path()
+    interactive = not args.non_interactive and sys.stdin.isatty()
+    if path.exists() and not args.force:
+        if not interactive:
+            eprint(f"{path} exists; use --force to overwrite")
+            return EXIT_USAGE
+        answer = _prompt(f"{path} exists; overwrite? [y/N]", "N")
+        if answer.lower() not in ("y", "yes"):
+            eprint("config kept")
+            return EXIT_OK
+
+    webhook_url = (args.webhook_url or "").strip()
+    if not webhook_url:
+        if not interactive:
+            eprint("--webhook-url is required with --non-interactive")
+            return EXIT_USAGE
+        webhook_url = _prompt("Webhook URL")
+    if not (webhook_url.startswith("https://") or webhook_url.startswith("http://")):
+        eprint("webhook URL must start with http:// or https://")
+        return EXIT_USAGE
+
+    bot_name = (args.bot_name or "").strip()
+    if not bot_name:
+        if interactive:
+            bot_name = _prompt("Bot name", DEFAULT_BOT_NAME)
+        else:
+            bot_name = DEFAULT_BOT_NAME
+    try:
+        bot_name = _clean_ident(bot_name, "bot_name", MAX_BOT_NAME_CHARS)
+    except UsageError as exc:
+        eprint(str(exc))
+        return EXIT_USAGE
+
+    accepts: list[str] = []
+    for raw in args.accept:
+        accepts.extend(part.strip() for part in raw.split(",") if part.strip())
+    if interactive and not accepts:
+        raw = _prompt(
+            "Allowed dial-back IPs/hostnames (comma separated, blank to skip)"
+        )
+        accepts = [a.strip() for a in raw.split(",") if a.strip()]
+
+    secret_cmd = (args.secret_cmd or "").strip()
+    secret_text = ""
+    if args.secret_stdin:
+        secret_text = _prompt_secret()
+        if not secret_text:
+            eprint("--secret-stdin was given but stdin had no secret")
+            return EXIT_USAGE
+    elif not secret_cmd and interactive:
+        choice = _prompt(
+            "Webhook secret: [f]ile / [c]ommand / [s]kip (env later)", "f"
+        ).lower()
+        if choice.startswith("f"):
+            secret_text = _prompt_secret()
+            if not secret_text:
+                eprint("empty secret; nothing written")
+                return EXIT_USAGE
+        elif choice.startswith("c"):
+            secret_cmd = _prompt("Secret command")
+
+    lines = [
+        f"bot_name = {_toml_quote(bot_name)}",
+        f"webhook_url = {_toml_quote(webhook_url)}",
+    ]
+    if args.who:
+        lines.append(f"who = {_toml_quote(args.who.strip())}")
+    if args.bind:
+        lines.append(f"bind = {_toml_quote(args.bind.strip())}")
+    if accepts:
+        lines.append(
+            "accept = ["
+            + ", ".join(_toml_quote(a) for a in accepts)
+            + "]"
+        )
+    if args.accept_ssh_host:
+        lines.append(
+            f"accept_ssh_host = {_toml_quote(args.accept_ssh_host.strip())}"
+        )
+    secret_path = path.parent / "secret"
+    if secret_text:
+        _write_private(secret_path, secret_text + "\n")
+        lines.append(f"secret_file = {_toml_quote(str(secret_path))}")
+    elif secret_cmd:
+        lines.append(f"secret_cmd = {_toml_quote(secret_cmd)}")
+
+    _write_private(path, "\n".join(lines) + "\n")
+    eprint(f"wrote {path} (mode 0600)")
+    if secret_text:
+        eprint(f"wrote {secret_path} (mode 0600)")
+    elif not secret_cmd:
+        eprint(
+            "no secret configured; set ASKSOUL_WEBHOOK_SECRET before using asksoul"
+        )
+    return EXIT_OK
+
+
+def parse_subcommand(name: str, rest: list[str]) -> argparse.Namespace:
+    """ls / close / wait / tui / init; argv[0] is one of them."""
+    if name == CMD_INIT:
+        return parse_init(rest)
+    if "--version" in rest:
+        print_version()
+    if any(arg in ("-h", "--help") for arg in rest):
+        print_help()
+    parser = new_parser()
+    if name == CMD_LS:
+        parser.parse_args(rest)
+        return argparse.Namespace(cmd=CMD_LS)
+    if name == CMD_CLOSE:
+        parser.add_argument("session_id", metavar="ID")
+        args = parser.parse_args(rest)
+        check_session_id(args.session_id)
+        return argparse.Namespace(cmd=CMD_CLOSE, session_id=args.session_id)
+    if name == CMD_TUI:
+        parser.add_argument("-w", "--who", dest="who", metavar="WHO")
+        parser.add_argument("-t", "--timeout", metavar="SEC")
+        parser.add_argument("-s", "--session", metavar="ID")
+        parser.add_argument("--wait", metavar="SEC")
+        args = parser.parse_args(rest)
+        if args.session is not None:
+            check_session_id(args.session)
+        who = None
+        if args.who is not None:
+            try:
+                who = _clean_ident(args.who, "WHO", MAX_WHO_CHARS)
+            except UsageError as exc:
+                usage_fail(str(exc))
+        return argparse.Namespace(
+            cmd=CMD_TUI,
+            session_id=(
+                args.session
+                if args.session is not None
+                else str(uuid.uuid4())
+            ),
+            generated_id=args.session is None,
+            who=who,
+            who_given=args.who is not None,
+            timeout_sec=parse_timeout_sec(args.timeout),
+            timeout_given=args.timeout is not None,
+            wait_sec=parse_wait_sec(args.wait),
+        )
+    parser.add_argument("session_id", metavar="ID")
+    parser.add_argument("--wait", metavar="SEC")
+    parser.add_argument("--json", dest="as_json", action="store_true")
+    args = parser.parse_args(rest)
+    check_session_id(args.session_id)
+    return argparse.Namespace(
+        cmd=CMD_WAIT,
+        session_id=args.session_id,
+        message=None,
+        wait_sec=parse_wait_sec(args.wait),
+        as_json=bool(args.as_json),
+    )
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    """Talk, notify and -s: one parser, then the cross-option rules."""
+    if argv and argv[0] == "--version":
+        print_version()
+    if argv and argv[0] in SUBCOMMANDS:
+        return parse_subcommand(argv[0], argv[1:])
+
+    parser = new_parser()
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("-w", "--who", dest="who", metavar="WHO")
+    parser.add_argument("-t", "--timeout", metavar="SEC")
+    parser.add_argument("-s", "--session", metavar="ID")
+    parser.add_argument("--wait", metavar="SEC")
+    parser.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="also print delivery JSON after the DELIVERY line",
+    )
+    parser.add_argument("words", nargs="*", metavar="MESSAGE")
+
+    # Intermixed: a positional word may follow an option
+    # ("asksoul hi -w X there"), which plain parse_args() rejects.
+    args = parser.parse_intermixed_args(argv)
+    if args.version:
+        print_version()
+    if args.help or not argv:
+        print_help(args.who)
+
+    if args.session is not None:
+        check_session_id(args.session)
+
+    args.wait_sec = parse_wait_sec(args.wait)
+    args.message = " ".join(args.words)
+    if not args.words:
+        if args.session is not None:
+            usage_fail(
+                "-s needs a message; to wait without sending use: asksoul wait ID"
+            )
+        usage_fail("a message is required")
+    if args.message == "":
+        usage_fail("message is empty")
+
+    if args.who is not None:
+        try:
+            args.who = _clean_ident(args.who, "WHO", MAX_WHO_CHARS)
+        except UsageError as exc:
+            usage_fail(str(exc))
+
+    # The session_id field is never optional in the data: -s names the
+    # thread; without -s a fresh UUID is generated here and main prints it.
+    args.generated_id = args.session is None
+    args.session_id = (
+        args.session if args.session is not None else str(uuid.uuid4())
+    )
+
+    # -w/-t apply only when this call opens the session (checked at run
+    # time, when the session is known to be live or not).
+    args.cmd = CMD_SESSION if args.session is not None else CMD_DEFAULT
+    args.timeout_sec = parse_timeout_sec(args.timeout)
+    args.as_json = bool(getattr(args, "as_json", False))
+    return args
+
+
+def open_session_now(
+    session_dir: Path,
+    session_id: str,
+    message: str,
+    who_override: Optional[str],
+    timeout_sec: int,
+    generated_id: bool,
+    sender_type: str = "user-cli",
+) -> int:
+    """Open a new session for MESSAGE: bind, webhook, spawn the daemon.
+
+    The CLI and the TUI both use this. It returns EXIT_OK once the
+    background session is live and a caller may attach; otherwise the
+    CLI error code (details already on stderr). The message is delivered
+    by the webhook, exactly like a normal ask; it is not sent again over
+    the control socket. TUI passes sender_type="user-tui" (continuous
+    conversation: do not close after each answer).
+    """
+    open_under_id(session_dir, session_id)
+    no_webhook = os.environ.get("ASKSOUL_NO_WEBHOOK") == "1"
+    try:
+        cfg = load_runtime_config(require_webhook=not no_webhook)
+    except UsageError as exc:
+        eprint(str(exc))
+        return EXIT_USAGE
+    except OSError:
+        eprint("cannot read config")
+        return EXIT_USAGE
+    url = cfg["url"]
+    sender_key = cfg["secret"]
+    who = cfg["who"]
+    source = cfg["source"]
+    if who_override is not None:
+        who = who_override
+
+    if generated_id:
+        # The id is ours for this run; the caller continues with -s.
+        eprint(f"session {session_id} (continue with -s {session_id})")
+
+    listener: Optional[socket.socket] = None
+    key: Optional[bytes] = None
+    try:
+        try:
+            host = self_bind_ipv4(cfg["data"])
+            allow = accept_list(cfg["data"])
+            key = make_key()
+            listener, port = bind_listener(host)
+        except SetupError as exc:
+            eprint(str(exc))
+            return EXIT_SETUP
+        if live_session(session_dir, session_id) is not None:
+            # Two callers opened this id at once: the other one opened
+            # it while we were binding. Failing is the simple safe
+            # choice: never clobber the session that won.
+            eprint(f"session {session_id} is already open")
+            return EXIT_USAGE
+        shutil.rmtree(session_dir, ignore_errors=True)
+        reply_meta = reply_object(host, port, timeout_sec, key, who)
+        allow_note = ",".join(sorted(allow))
+        sid = f" session={session_id}"
+        fp = hashlib.sha256(key).hexdigest()[:8]
+        eprint(
+            f"listening {host}:{port} allow {allow_note} "
+            f"idle timeout {timeout_sec}s{sid} key_fp={fp}"
+        )
+
+        payload = build_payload(
+            message,
+            reply_meta,
+            session_id,
+            source,
+            who,
+            sender_type=sender_type,
+        )
+        try:
+            if os.environ.get("ASKSOUL_NO_WEBHOOK") == "1":
+                line = json.dumps({"no_webhook": True,
+                    "host": reply_meta["host"], "port": reply_meta["port"],
+                    "key_b64": reply_meta["crypto"]["key_b64"],
+                    "session_id": session_id})
+                sys.stderr.write(line + "\n")
+                sys.stderr.flush()
+            else:
+                post_webhook(url, sender_key, payload)
+        except WebhookError as exc:
+            eprint(f"webhook failed ({exc.detail})")
+            return EXIT_WEBHOOK
+
+        assert listener is not None and key is not None
+        meta = build_session_meta(
+            session_id,
+            who,
+            source,
+            reply_meta["host"],
+            reply_meta["port"],
+            timeout_sec,
+            message,
+        )
+        try:
+            spawn_daemon(
+                session_dir,
+                meta,
+                listener,
+                key,
+                allow,
+                timeout_sec,
+                session_id,
+                who,
+                source,
+                reply_meta,
+                url,
+                sender_key,
+            )
+        except OSError:
+            eprint("cannot start the background session process")
+            return EXIT_SETUP
+        # Plain close: the daemon owns the listener now, and shutdown()
+        # would tear down the shared socket it is accepting on.
+        try:
+            listener.close()
+        except OSError:
+            pass
+        listener = None
+        return EXIT_OK
+    finally:
+        if listener is not None:
+            close_quietly(listener)
+        key = None
+
+
+# ---------------------------------------------------------------------------
+# TUI (asksoul tui): a small curses chat over the same session daemon.
+# ---------------------------------------------------------------------------
+
+
+def _char_cells(ch: str) -> int:
+    """Approximate terminal cells for one character (CJK is two)."""
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def _display_width(text: str) -> int:
+    return sum(_char_cells(ch) for ch in text)
+
+
+def _take_cells(text: str, width: int) -> tuple[str, int]:
+    """The longest prefix of text that fits in width cells (>= 1 char)."""
+    used = 0
+    for index, ch in enumerate(text):
+        cells = _char_cells(ch)
+        if used + cells > width and index > 0:
+            return text[:index], used
+        used += cells
+    return text, used
+
+
+def _clip_cells(text: str, width: int) -> str:
+    """text cut to at most width cells (never splits a double-width char)."""
+    if width <= 0:
+        return ""
+    if _display_width(text) <= width:
+        return text
+    head, _ = _take_cells(text, width)
+    return head
+
+
+_WORD_RE = re.compile(r"\s+|[^\s]+")
+
+
+def wrap_display(text: str, width: int) -> list[str]:
+    """Wrap text to width terminal cells; newlines are hard breaks.
+
+    Long unbroken words (and CJK runs) are split by cells, so a line
+    never exceeds the visible width.
+    """
+    width = max(1, width)
+    out: list[str] = []
+    for raw in text.replace("\t", "    ").split("\n"):
+        raw = "".join(ch for ch in raw if ch.isprintable() or ch == " ")
+        if raw == "":
+            out.append("")
+            continue
+        line = ""
+        line_w = 0
+        for token in _WORD_RE.findall(raw):
+            if token.isspace():
+                if not line:
+                    continue
+                tw = _display_width(token)
+                if line_w + tw <= width:
+                    line += token
+                    line_w += tw
+                else:
+                    out.append(line.rstrip())
+                    line, line_w = "", 0
+                continue
+            tw = _display_width(token)
+            if line_w + tw <= width:
+                line += token
+                line_w += tw
+                continue
+            if line:
+                out.append(line.rstrip())
+                line, line_w = "", 0
+            while tw > width:
+                head, used = _take_cells(token, width)
+                if not head:
+                    break
+                out.append(head)
+                token = token[len(head):]
+                tw -= used
+            if token:
+                line, line_w = token, tw
+        out.append(line.rstrip())
+    return out
+
+
+class _TuiTextCapture:
+    """A sys.stdout/sys.stderr stand-in that keeps text (and .buffer)."""
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self.buffer = self
+
+    def write(self, data: Any) -> int:
+        if isinstance(data, bytes):
+            self._parts.append(data.decode("utf-8", "replace"))
+        else:
+            self._parts.append(str(data))
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def getvalue(self) -> str:
+        return "".join(self._parts)
+
+
+class Tui:
+    """The curses UI. One thread only; the open path uses a worker thread."""
+
+    def __init__(self, stdscr: Any, args: argparse.Namespace) -> None:
+        self.scr = stdscr
+        self.session_id: str = args.session_id
+        self.generated_id: bool = args.generated_id
+        self.session_dir = session_dir_for(self.session_id)
+        self.who_override: Optional[str] = args.who
+        self.timeout_sec: int = args.timeout_sec
+        self.wait_sec: int = args.wait_sec
+        help_who, _help_source, self.bot_name = peek_config()
+        self.who: str = args.who if args.who is not None else help_who
+        self.transcript: deque[tuple[str, int]] = deque(
+            maxlen=TUI_MAX_ENTRIES
+        )
+        self.version = 0
+        self.wrap_cache_width: Optional[int] = None
+        self.wrap_cache_version = -1
+        self.wrap_cache: list[tuple[str, int]] = []
+        self.scroll_from_bottom = 0
+        self.draft = ""
+        self.phase = "idle"  # idle | opening | waiting
+        self.wait_started = 0.0
+        self.wait_deadline: Optional[float] = None
+        self.wait_kind = ""
+        self.session_open = False
+        self.ctl: Optional[socket.socket] = None
+        self.ctl_buf = bytearray()
+        self.open_queue: Optional[queue.Queue] = None
+        self.open_in_flight = False
+        self.open_cancelled = False
+        self.idle_left: Optional[int] = None
+        self.info_at: Optional[float] = None
+        self.last_info_request = 0.0
+        self._last_draw_sec = -1
+        self.running = True
+        self.dirty = True
+        self.exit_code = EXIT_OK
+        self.pasting = False
+
+    # -- transcript -----------------------------------------------------
+
+    def add_text(self, text: str, style: int = 0) -> None:
+        if text == "":
+            return
+        self.transcript.append((text, style))
+        self.version += 1
+        self.dirty = True
+
+    def add_system(self, text: str) -> None:
+        self.add_text(text, curses.A_DIM)
+
+    # -- lifecycle ------------------------------------------------------
+
+    def run(self) -> int:
+        try:
+            curses.raw()
+        except curses.error:
+            pass
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        self.scr.keypad(True)
+        self.scr.timeout(TUI_TICK_MS)
+        self._set_bracketed_paste(True)
+        self.add_system(
+            f"# asksoul tui {VERSION} — session {self.session_id}"
+        )
+        self.add_system("# /help for commands; first Enter opens the session")
+        self.attach_existing()
+        try:
+            while self.running:
+                self.drain_open_result()
+                self.read_ctl()
+                self.tick()
+                self.draw()
+                self.handle_key(self.get_key())
+        finally:
+            self._set_bracketed_paste(False)
+            self.close_ctl()
+        return self.exit_code
+
+    def _set_bracketed_paste(self, on: bool) -> None:
+        """Ask the terminal to wrap pastes in CSI 200~/201~ (DECSET 2004)."""
+        seq = TUI_BRACKETED_PASTE_ON if on else TUI_BRACKETED_PASTE_OFF
+        for fd in (sys.stdout.fileno(), sys.stderr.fileno()):
+            try:
+                os.write(fd, seq)
+                return
+            except OSError:
+                continue
+
+    def _read_csi_after_esc(self) -> str:
+        """Drain a CSI after a bare Esc; restore get_wch timeout afterward.
+
+        Returns the CSI body including '[' and the final byte (e.g. '[200~'),
+        or '' if nothing followed (bare Esc / timeout).
+        """
+        self.scr.timeout(TUI_ESC_PEEK_MS)
+        try:
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                return ""
+            if ch != "[" and ch != ord("["):
+                # Not CSI: push the key back if possible, else drop.
+                try:
+                    if isinstance(ch, str):
+                        curses.unget_wch(ch)
+                    else:
+                        curses.ungetch(ch)
+                except (curses.error, TypeError, OverflowError):
+                    pass
+                return ""
+            parts = ["["]
+            while True:
+                try:
+                    nxt = self.scr.get_wch()
+                except curses.error:
+                    break
+                if isinstance(nxt, int):
+                    # Unexpected keypad code mid-CSI; stop.
+                    try:
+                        curses.ungetch(nxt)
+                    except (curses.error, OverflowError):
+                        pass
+                    break
+                parts.append(nxt)
+                # CSI final byte is in @-_ or ~ for the paste markers.
+                if ("@" <= nxt <= "~") and nxt not in "0123456789;?:":
+                    break
+                if len(parts) > 16:
+                    break
+            return "".join(parts)
+        finally:
+            self.scr.timeout(TUI_TICK_MS)
+
+    def close_ctl(self) -> None:
+        if self.ctl is not None:
+            close_quietly(self.ctl)
+            self.ctl = None
+        self.ctl_buf.clear()
+        self.session_open = False
+
+    def attach_existing(self) -> None:
+        """With -s, attach a live session (inbound frames show immediately)."""
+        if self.generated_id:
+            return
+        state = session_state(self.session_dir, self.session_id)
+        if state == STATE_LIVE:
+            if self.attach_ctl(TUI_ATTACH_WAIT_SEC):
+                self.add_system(f"# attached to session {self.session_id}")
+            else:
+                self.add_system(
+                    f"# session {self.session_id} is open but did not "
+                    "answer; first Enter opens a new one"
+                )
+        elif state == STATE_ENDED:
+            meta = read_session_meta(self.session_dir) or {}
+            reason = meta.get("ended")
+            if not isinstance(reason, str):
+                reason = "?"
+            self.add_system(
+                f"# session {self.session_id} ended ({reason}); "
+                "first Enter opens a new one"
+            )
+        else:
+            self.add_system(
+                f"# no open session {self.session_id}; "
+                "first Enter opens a new one"
+            )
+
+    def attach_ctl(self, wait: float) -> bool:
+        conn = connect_session(self.session_dir, self.session_id, wait)
+        if conn is None:
+            return False
+        if not send_event(conn, {"op": OP_ATTACH}):
+            close_quietly(conn)
+            return False
+        self.ctl = conn
+        self.session_open = True
+        self.last_info_request = 0.0
+        return True
+
+    # -- opening (worker thread: the webhook POST can take ~40 s) -------
+
+    def start_open(self, text: str) -> None:
+        self.phase = "opening"
+        self.open_in_flight = True
+        self.open_cancelled = False
+        self.wait_started = time.monotonic()
+        self.wait_deadline = None
+        self.wait_kind = "open"
+        self.open_queue = queue.Queue()
+        session_dir = self.session_dir
+        session_id = self.session_id
+        who_override = self.who_override
+        timeout_sec = self.timeout_sec
+        result_q = self.open_queue
+
+        def work() -> None:
+            out_cap = _TuiTextCapture()
+            err_cap = _TuiTextCapture()
+            code = EXIT_SETUP
+            try:
+                with contextlib.redirect_stdout(out_cap):
+                    with contextlib.redirect_stderr(err_cap):
+                        code = open_session_now(
+                            session_dir,
+                            session_id,
+                            text,
+                            who_override,
+                            timeout_sec,
+                            False,
+                            sender_type="user-tui",
+                        )
+            except BaseException as exc:  # noqa: BLE001 - reported in pane
+                err_cap.write(f"asksoul: opening failed: {exc}\n")
+                code = EXIT_SETUP
+            result_q.put((code, out_cap.getvalue(), err_cap.getvalue()))
+
+        threading.Thread(
+            target=work, name="asksoul-tui-open", daemon=True
+        ).start()
+        self.dirty = True
+
+    def drain_open_result(self) -> None:
+        if self.open_queue is None:
+            return
+        try:
+            code, out_text, err_text = self.open_queue.get_nowait()
+        except queue.Empty:
+            return
+        self.open_queue = None
+        self.open_in_flight = False
+        for line in err_text.splitlines():
+            if not line.strip():
+                continue
+            if "key_b64" in line or "WEBHOOK_SENDER_KEY" in line:
+                continue  # never put a secret in the pane
+            if line.startswith("asksoul: "):
+                line = line[len("asksoul: "):]
+            self.add_system(f"# {line}")
+        for line in out_text.splitlines():
+            # A lingering ended session's unread frames (CLI format).
+            if line.strip():
+                style = curses.A_DIM if line.startswith("#") else 0
+                self.add_text(line, style)
+        self.phase = "idle"
+        self.wait_deadline = None
+        self.wait_kind = ""
+        if code != EXIT_OK:
+            self.add_system(
+                f"# error: could not open the session (exit {code})"
+            )
+            self.dirty = True
+            return
+        if self.attach_ctl(TUI_ATTACH_WAIT_SEC):
+            self.add_system(f"# session open; waiting for {self.bot_name}")
+            if not self.open_cancelled:
+                # The first line went out with the webhook: it is a turn too.
+                self.start_wait("send")
+        else:
+            self.add_system(
+                "# error: session opened but the control socket did not answer"
+            )
+        self.dirty = True
+
+    # -- sending --------------------------------------------------------
+
+    def send_msg(self, text: str) -> bool:
+        if self.ctl is None:
+            return False
+        ok = send_event(self.ctl, {"op": OP_MSG, "body": text + "\n"})
+        if not ok:
+            self.close_ctl()
+        return ok
+
+    def submit(self) -> None:
+        text = self.draft
+        if not text.strip():
+            self.draft = ""
+            self.dirty = True
+            return
+        if text.startswith("/"):
+            self.draft = ""
+            self.dirty = True
+            self.slash(text.strip())
+            return
+        if self.open_in_flight:
+            self.add_system(
+                "# still opening the session; the line was not sent"
+            )
+            return
+        self.draft = ""
+        self.dirty = True
+        self.add_text(f"[you] {text}")
+        if not self.session_open:
+            self.start_open(text)
+            return
+        if not self.send_msg(text):
+            self.add_system(
+                "# error: the session is not reachable; "
+                "reopening under the same session id"
+            )
+            self.start_open(text)
+            return
+        self.start_wait("send")
+
+    def slash(self, text: str) -> None:
+        if text == "/help":
+            for line in TUI_HELP_LINES:
+                self.add_system(line)
+            return
+        if text == "/clear":
+            self.transcript.clear()
+            self.version += 1
+            self.scroll_from_bottom = 0
+            self.dirty = True
+            return
+        if text == "/wait":
+            if not self.session_open:
+                self.add_system(
+                    "# no open session; type a message and press Enter first"
+                )
+                return
+            self.add_system("# waiting for the next inbound message")
+            self.start_wait("cmd")
+            return
+        if text in ("/close", "/quit"):
+            self.quit_tui()
+            return
+        self.add_system(f"# unknown command: {text} (try /help)")
+
+    # -- wait/status ----------------------------------------------------
+
+    def start_wait(self, kind: str) -> None:
+        self.phase = "waiting"
+        self.wait_kind = kind
+        self.wait_started = time.monotonic()
+        self.wait_deadline = self.wait_started + self.wait_sec
+        self.dirty = True
+
+    def end_wait(self) -> None:
+        if self.phase == "waiting":
+            self.phase = "idle"
+            self.wait_deadline = None
+            self.wait_kind = ""
+            self.dirty = True
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        if (
+            self.phase == "waiting"
+            and self.wait_deadline is not None
+            and now >= self.wait_deadline
+        ):
+            self.phase = "idle"
+            self.wait_deadline = None
+            self.wait_kind = ""
+            self.add_system("# nothing yet (still listening)")
+        if (
+            self.ctl is not None
+            and now - self.last_info_request >= TUI_INFO_POLL_SEC
+        ):
+            self.last_info_request = now
+            if not send_event(self.ctl, {"op": OP_INFO}):
+                self.on_disconnect()
+
+    def quit_tui(self) -> None:
+        if self.ctl is not None:
+            try:
+                if send_event(self.ctl, {"op": OP_CLOSE}):
+                    read_json_line(self.ctl, 1.0)
+            except OSError:
+                pass
+        self.close_ctl()
+        self.phase = "idle"
+        self.wait_deadline = None
+        self.running = False
+
+    def on_disconnect(self) -> None:
+        was_open = self.session_open
+        self.close_ctl()
+        if self.phase == "waiting":
+            self.phase = "idle"
+            self.wait_deadline = None
+            self.wait_kind = ""
+        if was_open:
+            self.add_system("# session disconnected")
+
+    # -- control socket -------------------------------------------------
+
+    def read_ctl(self) -> None:
+        if self.ctl is None:
+            return
+        # An event handler (close/end) may close the socket mid-batch.
+        while self.ctl is not None:
+            try:
+                ready, _, _ = select.select([self.ctl], [], [], 0)
+            except (OSError, ValueError):
+                self.on_disconnect()
+                return
+            if not ready:
+                return
+            try:
+                chunk = self.ctl.recv(65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self.on_disconnect()
+                return
+            self.ctl_buf.extend(chunk)
+            while True:
+                nl = self.ctl_buf.find(b"\n")
+                if nl == -1:
+                    break
+                line = bytes(self.ctl_buf[:nl])
+                del self.ctl_buf[: nl + 1]
+                if line.endswith(b"\r"):
+                    line = line[:-1]
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(obj, dict):
+                    self.on_event(obj)
+            if len(self.ctl_buf) > MAX_FRAME_BYTES:
+                self.ctl_buf.clear()
+
+    def _refresh_info(self) -> None:
+        self.idle_left = None
+        self.info_at = None
+        self.last_info_request = 0.0
+
+    def on_event(self, obj: dict[str, Any]) -> None:
+        ev = obj.get("ev")
+        if ev == "info":
+            left = obj.get("idle_left")
+            if isinstance(left, (int, float)):
+                self.idle_left = max(0, int(left))
+                self.info_at = time.monotonic()
+            timeout = obj.get("timeout_sec")
+            if isinstance(timeout, int):
+                self.timeout_sec = timeout
+            who = obj.get("who")
+            if isinstance(who, str) and who:
+                self.who = who
+            ended = obj.get("ended")
+            if isinstance(ended, str):
+                self.add_system(f"# session ended ({ended})")
+                self.end_wait()
+                self.close_ctl()
+            self.dirty = True
+        elif ev == "status":
+            body = obj.get("body")
+            if isinstance(body, str):
+                self.add_system(f"# status: {body.rstrip(chr(10))}")
+            self._refresh_info()
+        elif ev == "msg":
+            body = obj.get("body")
+            if isinstance(body, str):
+                from_name = obj.get("from")
+                if not isinstance(from_name, str):
+                    from_name = None
+                queued_at = obj.get("queued_at")
+                if not isinstance(queued_at, str):
+                    queued_at = None
+                text = format_msg(from_name, body, queued_at)
+                if text.endswith("\n"):
+                    text = text[:-1]
+                self.add_text(text)
+                self.end_wait()
+                self._refresh_info()
+        elif ev == "relayed":
+            name = obj.get("name")
+            if isinstance(name, str):
+                from_name = obj.get("from")
+                if not isinstance(from_name, str):
+                    from_name = None
+                queued_at = obj.get("queued_at")
+                if not isinstance(queued_at, str):
+                    queued_at = None
+                self.add_text(
+                    format_relayed(from_name, name, queued_at).rstrip("\n"),
+                    curses.A_DIM,
+                )
+                self.end_wait()
+                self._refresh_info()
+        elif ev == "ack":
+            from_name = obj.get("from")
+            if not isinstance(from_name, str):
+                from_name = None
+            self.add_text(
+                format_ack(from_name).rstrip("\n"), curses.A_DIM
+            )
+            self._refresh_info()
+        elif ev == "close":
+            reason = obj.get("reason")
+            reason = reason if isinstance(reason, str) else ""
+            note = "# session closed" + (f" ({reason})" if reason else "")
+            self.add_system(note)
+            self.add_system(
+                f"# same session id {self.session_id}; next Enter reopens it"
+            )
+            self.end_wait()
+            self.close_ctl()
+        elif ev == "end":
+            reason = obj.get("reason")
+            reason = reason if isinstance(reason, str) else ""
+            note = "# session ended" + (f" ({reason})" if reason else "")
+            self.add_system(note)
+            self.add_system(
+                f"# same session id {self.session_id}; next Enter reopens it"
+            )
+            self.end_wait()
+            self.close_ctl()
+        elif ev == "sent":
+            self.add_system("# status: sent")
+            self._refresh_info()
+        elif ev == "rewoke":
+            self.add_system(f"# status: webhook re-sent; waiting for {self.bot_name}")
+            self._refresh_info()
+        elif ev == "webhook_failed":
+            detail = obj.get("detail")
+            if not isinstance(detail, str) or not detail:
+                detail = "unknown error"
+            self.add_system(
+                f"# error: could not reach {self.bot_name}; the line was not delivered "
+                f"({detail})"
+            )
+            self.end_wait()
+
+    # -- keys -----------------------------------------------------------
+
+    def get_key(self) -> Any:
+        try:
+            return self.scr.get_wch()
+        except curses.error:
+            return None
+
+    def on_ctrl_c(self) -> None:
+        if self.phase in ("waiting", "opening"):
+            if self.phase == "opening":
+                self.open_cancelled = True
+            self.phase = "idle"
+            self.wait_deadline = None
+            self.wait_kind = ""
+            self.add_system("# cancelled")
+            return
+        self.quit_tui()
+
+    def handle_key(self, key: Any) -> None:
+        if key is None:
+            return
+        if isinstance(key, str):
+            if key == "\x03":
+                self.on_ctrl_c()
+            elif key in ("\n", "\r"):
+                if self.pasting:
+                    self.draft += "\n"
+                    self.dirty = True
+                else:
+                    self.submit()
+            elif key in ("\x7f", "\x08"):
+                if self.draft:
+                    self.draft = self.draft[:-1]
+                    self.dirty = True
+            elif key == "\x1b":
+                csi = self._read_csi_after_esc()
+                if csi == TUI_PASTE_BEGIN:
+                    self.pasting = True
+                elif csi == TUI_PASTE_END:
+                    self.pasting = False
+                elif csi == "":
+                    # Bare Esc: clear draft (unchanged).
+                    if self.draft:
+                        self.draft = ""
+                        self.dirty = True
+                # Unknown CSI: ignore (do not clear draft mid-sequence).
+            elif key == "\x0c":
+                try:
+                    self.scr.clear()
+                except curses.error:
+                    pass
+                self.dirty = True
+            elif key == "\t":
+                if self.pasting:
+                    self.draft += "\t"
+                    self.dirty = True
+            elif key.isprintable():
+                self.draft += key
+                self.dirty = True
+            return
+        if key == curses.KEY_RESIZE:
+            try:
+                self.scr.clear()
+            except curses.error:
+                pass
+            self.dirty = True
+        elif key == curses.KEY_PPAGE:
+            self.scroll_page(1)
+        elif key == curses.KEY_NPAGE:
+            self.scroll_page(-1)
+        elif key == curses.KEY_UP:
+            self.scroll_lines(1)
+        elif key == curses.KEY_DOWN:
+            self.scroll_lines(-1)
+        elif key == curses.KEY_BACKSPACE:
+            if self.draft:
+                self.draft = self.draft[:-1]
+                self.dirty = True
+        elif key == curses.KEY_ENTER:
+            if self.pasting:
+                self.draft += "\n"
+                self.dirty = True
+            else:
+                self.submit()
+        elif key == curses.KEY_DC:
+            pass
+
+    def scroll_page(self, direction: int) -> None:
+        height, _ = self.scr.getmaxyx()
+        page = max(
+            1, height - 1 - TUI_INPUT_MAX_ROWS - TUI_SCROLL_PAGE_MARGIN
+        )
+        self.scroll_from_bottom = max(
+            0, self.scroll_from_bottom + direction * page
+        )
+        self.dirty = True
+
+    def scroll_lines(self, direction: int) -> None:
+        self.scroll_from_bottom = max(
+            0, self.scroll_from_bottom + direction
+        )
+        self.dirty = True
+
+    # -- drawing --------------------------------------------------------
+
+    def _flat_lines(self, width: int) -> list[tuple[str, int]]:
+        if (
+            self.wrap_cache_width == width
+            and self.wrap_cache_version == self.version
+        ):
+            return self.wrap_cache
+        flat: list[tuple[str, int]] = []
+        for text, style in self.transcript:
+            for line in wrap_display(text, width):
+                flat.append((line, style))
+        self.wrap_cache_width = width
+        self.wrap_cache_version = self.version
+        self.wrap_cache = flat
+        return flat
+
+    def _addstr(
+        self, row: int, col: int, text: str, style: int = 0
+    ) -> None:
+        try:
+            self.scr.addstr(row, col, text, style)
+        except curses.error:
+            pass
+
+    def draw(self) -> None:
+        now = time.monotonic()
+        sec = int(now)
+        needs = self.dirty
+        if self.phase != "idle" and sec != self._last_draw_sec:
+            needs = True
+        if not needs:
+            return
+        self.dirty = False
+        self._last_draw_sec = sec
+        try:
+            height, width = self.scr.getmaxyx()
+        except curses.error:
+            return
+        if height < 1 or width < 1:
+            return
+        width = max(1, width)
+
+        idle_text = "—"
+        if self.idle_left is not None and self.info_at is not None:
+            idle_text = (
+                f"{max(0, self.idle_left - int(now - self.info_at))}s"
+            )
+        parts = [
+            "asksoul tui",
+            f"session: {self.session_id}",
+            f"who: {self.who}",
+            f"idle: {idle_text}",
+        ]
+        if self.phase == "opening":
+            parts.append(f"opening… {int(now - self.wait_started)}s")
+        elif self.phase == "waiting":
+            parts.append(f"waiting… {int(now - self.wait_started)}s")
+        status = "   ".join(parts)
+        # Pad under A_REVERSE so a shorter status does not leave old cells.
+        status_cells = _clip_cells(status, width - 1)
+        pad = max(0, (width - 1) - _display_width(status_cells))
+        self._addstr(0, 0, status_cells + (" " * pad), curses.A_REVERSE)
+
+        avail = max(1, width - 2)
+        wrapped = wrap_display(self.draft, avail)
+        if not wrapped:
+            wrapped = [""]
+        if height <= 1:
+            return
+        input_h = min(
+            max(1, len(wrapped)), TUI_INPUT_MAX_ROWS, height - 1
+        )
+        shown = wrapped[-input_h:]
+        trans_h = max(0, height - 1 - input_h)
+        if trans_h > 0:
+            flat = self._flat_lines(width)
+            max_offset = max(0, len(flat) - trans_h)
+            self.scroll_from_bottom = min(
+                self.scroll_from_bottom, max_offset
+            )
+            start = max(
+                0, len(flat) - trans_h - self.scroll_from_bottom
+            )
+            visible = flat[start : start + trans_h]
+            for row in range(trans_h):
+                if row < len(visible):
+                    text, style = visible[row]
+                else:
+                    text, style = "", 0
+                self._addstr(1 + row, 0, text, style)
+                try:
+                    self.scr.clrtoeol()
+                except curses.error:
+                    pass
+
+        input_top = height - input_h
+        # When Backspace shrinks wrapped input rows, those rows move into
+        # the transcript band (trans_h grows) and are redrawn + clrtoeol
+        # above — no separate leftover wipe (that would erase transcript).
+        first_prefix = "> " if len(wrapped) <= len(shown) else "  "
+        for row, line in enumerate(shown):
+            prefix = first_prefix if row == 0 else "  "
+            self._addstr(input_top + row, 0, prefix + line)
+            # Backspace / Esc shorten the draft; without clrtoeol the old
+            # glyphs stay on screen (classic curses leftover).
+            try:
+                self.scr.clrtoeol()
+            except curses.error:
+                pass
+        cursor_row = input_top + len(shown) - 1
+        cursor_col = 2 + _display_width(shown[-1])
+        cursor_col = max(0, min(cursor_col, width - 1))
+        try:
+            self.scr.move(cursor_row, cursor_col)
+        except curses.error:
+            pass
+
+
+def run_tui(args: argparse.Namespace) -> int:
+    """Entry for `asksoul tui`; returns the process exit code."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.stderr.write("asksoul tui needs a TTY\n")
+        try:
+            sys.stderr.flush()
+        except OSError:
+            pass
+        return EXIT_WEBHOOK  # SPEC: exit 2 when not a TTY.
+    if not args.generated_id:
+        state = session_state(
+            session_dir_for(args.session_id), args.session_id
+        )
+        if state == STATE_LIVE and (
+            args.who_given or args.timeout_given
+        ):
+            eprint(
+                f"session {args.session_id} is open; -w and -t only apply "
+                "when a session opens"
+            )
+            return EXIT_USAGE
+    if args.generated_id:
+        eprint(f"session {args.session_id}")
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    os.environ.setdefault("ESCDELAY", "25")
+
+    def _tui_stop(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    old_handlers: dict[int, Any] = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            old_handlers[sig] = signal.signal(sig, _tui_stop)
+        except (OSError, ValueError):
+            pass
+    try:
+        return int(curses.wrapper(lambda scr: Tui(scr, args).run()))
+    except KeyboardInterrupt:
+        return EXIT_OK
+    except curses.error as exc:
+        eprint(f"tui: curses error: {exc}")
+        return EXIT_SETUP
+    finally:
+        for sig, handler in old_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except (OSError, ValueError):
+                pass
+
+
+def main(argv: list[str]) -> int:
+    if os.environ.get(DAEMON_FD_ENV):
+        # Not a CLI call: this process is the exec'd background session
+        # (spawn_daemon set the marker; see daemon_entry).
+        return daemon_entry()
+    try:
+        args = parse_args(argv)
+    except SystemExit as exc:
+        code = exc.code
+        if code is None:
+            return EXIT_OK
+        return int(code) if isinstance(code, int) else EXIT_USAGE
+
+    try:
+        if args.cmd == CMD_INIT:
+            return cmd_init(args)
+        if args.cmd == CMD_LS:
+            return list_sessions()
+        if args.cmd == CMD_CLOSE:
+            return close_session(session_dir_for(args.session_id), args.session_id)
+        _, _, bot_name = peek_config()
+        if args.cmd == CMD_WAIT:
+            return run_turn(
+                session_dir_for(args.session_id),
+                args.session_id,
+                None,
+                args.wait_sec,
+                as_json=getattr(args, "as_json", False),
+                bot_name=bot_name,
+            )
+        if args.cmd == CMD_TUI:
+            return run_tui(args)
+        # Talk: a live session under this id is continued. Anything else
+        # (new, closed or expired) opens a new session under it: the -s
+        # ID, or the UUID parse_args generated when -s was omitted.
+        session_dir = session_dir_for(args.session_id)
+        if session_state(session_dir, args.session_id) == STATE_LIVE:
+            # Open and not ended: continue it. -w/-t apply only when a
+            # call opens a session, so on an already open one they are a
+            # usage error here, before anything is sent.
+            if args.who is not None or args.timeout is not None:
+                usage_fail(
+                    f"session {args.session_id} is open; -w and -t only "
+                    "apply when a session opens"
+                )
+            return run_turn(
+                session_dir,
+                args.session_id,
+                args.message,
+                args.wait_sec,
+                as_json=getattr(args, "as_json", False),
+                bot_name=bot_name,
+            )
+        # Not live: drain a lingering end, then open a new session.
+        code = open_session_now(
+            session_dir,
+            args.session_id,
+            args.message,
+            args.who,
+            args.timeout_sec,
+            args.generated_id,
+        )
+        if code != EXIT_OK:
+            return code
+        return run_turn(
+            session_dir,
+            args.session_id,
+            None,
+            args.wait_sec,
+            DAEMON_READY_TIMEOUT,
+            as_json=getattr(args, "as_json", False),
+            bot_name=bot_name,
+        )
+    except KeyboardInterrupt:
+        eprint("interrupted")
+        return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

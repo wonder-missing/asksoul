@@ -1,0 +1,1006 @@
+#!/usr/bin/env python3
+"""asksoul-talk: the bot-side helper for AskSoul sessions.
+
+asksoul is for asking and waiting for a reply; content that only needs to
+inform, with no reply expected, belongs in a shared record file instead.
+
+Crypto contract (hard):
+  Each webhook reply block is one atomic triple: host + port + crypto.key_b64.
+  Always pass THIS webhook's triple into --host/--port/--key-b64.
+  Never reuse an older key because session_id matched a prior thread.
+  A new port always replaces any saved handoff; do not mix old KEY with new PORT.
+
+Every frame carries from=NAME: every subcommand takes --from NAME (default:
+$ASKSOUL_BOT_NAME, else "Soul"). A frame flushed from the outbox also carries
+queued_at, the time of the original send attempt. Canonical MAC input
+(bytes, UTF-8):
+  no queued_at, no from:  body
+  no queued_at, from:     from + "\n" + body
+  queued_at, from:        from + "\0" + queued_at + "\n" + body
+
+Bots (non-interactive shells): pick by whether you need the caller to answer.
+  - Nothing more to hear: one-shot `send`, then `close` when the thread is done.
+  - You end with a question and want the answer now: `ask`. It sends the frame,
+    keeps the connection (no close) and prints the caller's next line on
+    stdout, then disconnects without close. A line the caller sends while no
+    bot holds the seat comes as a new webhook for the same session_id.
+    One-shot send only listens ~5 s, so never `send` a question.
+    Loop `ask` per turn; finish with `close` (or the caller closes).
+
+Ask and wait for the caller's next line (exit 0 got it, 3 timeout,
+7 CLI closed, 4 queued in outbox; a line printed before a 7 still counts).
+After the first line, anything else that lands within ~1 s is printed too.
+
+  asksoul-talk ask --host HOST --port PORT --key-b64 KEY \\
+    --session ID --wait 300 --body 'ANSWER ... QUESTION? Reply in one line, I am waiting.'
+
+Every subcommand that connects sends one kind=ack frame immediately after
+connecting (automatic, no flag), before outbox frames and before this
+call's frames: the dialer named in from has received this session's latest
+line(s). ack has an empty body, is never queued, and if writing it fails
+the dial counts as failed as usual.
+
+Each dialing call ends with a machine-readable delivery line on stdout:
+  DELIVERY ack | DELIVERY relayed | DELIVERY unconfirmed
+With --json, a {"delivery":"..."} JSON object follows. Exit codes unchanged.
+
+One-shot only. send/status/relayed/close write their frames, then listen
+ASKSOUL_DRAIN_SEC (default 5) s and print every frame the CLI sends meanwhile
+on stdout: msg body as-is, "# status: TEXT", "# relayed: NAME",
+"# close[: REASON]".
+Then they disconnect without close. The JSON summary goes to stderr.
+Exit 0 sent; 7 the CLI sent kind=close (session over); 1 dial/send failed;
+4 queued in outbox.
+
+Outbox (mechanical storage, no judgment): a msg or relayed frame that cannot
+reach the CLI (dial or write failure) is stored locally, per session_id, and
+the call exits 4. Never the key, host, port or mac. Every later dial for that
+session_id, from any subcommand and using that webhook's own host/port/key,
+sends the stored frames first, in order, then the new frame. Stored frames
+go out unchanged except re-signed with the current key and marked with
+queued_at (the original attempt time), so the CLI shows them as queued. Rows
+go away only after a successful write.
+status and close are never queued (an old close must not end a later session;
+close that cannot dial still exits 1). TTL 7 days and a 500-row cap are
+enforced on insert; env ASKSOUL_OUTBOX_TTL_SEC, ASKSOUL_OUTBOX_MAX_ROWS,
+ASKSOUL_OUTBOX_DB. `outbox` lists pending rows (read-only). Default path:
+${XDG_STATE_HOME:-~/.local/state}/asksoul-talk/outbox.sqlite3 (0600 in a 0700
+dir).
+
+  asksoul-talk send --host HOST --port PORT --key-b64 KEY \\
+    --session ID --kind msg --body 'TEXT'
+
+  asksoul-talk status --host HOST --port PORT --key-b64 KEY \\
+    --session ID --body accepted
+
+  # after delivering a relay to another bot (receipt; the CLI's turn exits 6,
+  # the session stays up, no resend):
+  asksoul-talk relayed --host HOST --port PORT --key-b64 KEY \\
+    --session ID --to 'BOTNAME'
+
+  asksoul-talk close --host HOST --port PORT --key-b64 KEY \\
+    --session ID
+
+kind=msg bodies end with a newline (this script appends one if missing).
+kind is always set: status, msg, relayed, close or ack (ack is automatic on
+every dial and never queued). msg is the only text kind.
+kind=close ends the CLI session. To free the connection, just disconnect
+without close; the session goes on.
+Never put HMAC keys or raw sockets in chat; call this script.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime
+import hashlib
+import hmac
+import json
+import os
+import re
+import select
+import socket
+import sqlite3
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+ALG = "hmac-sha256-v1"
+KINDS = frozenset({"status", "msg", "relayed", "close", "ack"})
+OUTBOX_KINDS = frozenset({"msg", "relayed"})
+QUEUED_AT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$"
+)
+MAX_FROM_CHARS = 64
+EXIT_QUEUED = 4
+
+
+def classify_delivery(*, reached: bool, kind: str | None = None) -> str:
+    """bot → CLI dial outcome as the fixed DELIVERY word.
+
+    reached=False (queued / dial failed with queue): unconfirmed.
+    reached=True and this call's frame was relayed: relayed.
+    reached=True otherwise (msg/status/close/ack-only dial): ack —
+    every successful dial already sent kind=ack first.
+    """
+    if not reached:
+        return "unconfirmed"
+    if kind == "relayed":
+        return "relayed"
+    return "ack"
+
+
+def emit_delivery(status: str, as_json: bool) -> None:
+    """Always print 'DELIVERY <status>' on stdout; with --json also JSON."""
+    print(f"DELIVERY {status}", flush=True)
+    if as_json:
+        print(json.dumps({"delivery": status}, ensure_ascii=False), flush=True)
+
+
+
+def b64e(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def b64d(text: str) -> bytes:
+    return base64.b64decode(text.encode("ascii"))
+
+
+def key_fp(key: bytes) -> str:
+    return hashlib.sha256(key).hexdigest()[:8]
+
+
+def valid_from_name(name: object) -> bool:
+    """Frame "from": 1..64 chars, no control chars, no [ or ], not only spaces."""
+    if not isinstance(name, str) or not 1 <= len(name) <= MAX_FROM_CHARS:
+        return False
+    if not name.strip():
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        return False
+    return "[" not in name and "]" not in name
+
+
+def from_name_arg(text: str) -> str:
+    """argparse type for --from NAME (exit 2 on a bad name)."""
+    if not valid_from_name(text):
+        raise argparse.ArgumentTypeError(
+            "NAME must be 1..64 chars, no control chars, no [ or ], "
+            "not only whitespace"
+        )
+    return text
+
+
+def valid_queued_at(value: object) -> bool:
+    """Frame "queued_at": ISO 8601, seconds, explicit offset."""
+    return isinstance(value, str) and QUEUED_AT_RE.fullmatch(value) is not None
+
+
+def frame_mac(
+    key: bytes,
+    from_name: Optional[str],
+    body: bytes,
+    queued_at: Optional[str] = None,
+) -> bytes:
+    """Canonical MAC input (bytes, UTF-8), by what the frame carries:
+      no queued_at, no from:  body
+      no queued_at, from:     from + "\\n" + body
+      queued_at, from:        from + "\\0" + queued_at + "\\n" + body
+
+    queued_at is valid only together with from; calling this with
+    queued_at and no from is a bug in the caller.
+    """
+    if queued_at is None:
+        if from_name is None:
+            return hmac.new(key, body, hashlib.sha256).digest()
+        data = from_name.encode("utf-8") + b"\n" + body
+    else:
+        if from_name is None:
+            raise ValueError("queued_at requires from")
+        data = (
+            from_name.encode("utf-8")
+            + b"\x00"
+            + queued_at.encode("utf-8")
+            + b"\n"
+            + body
+        )
+    return hmac.new(key, data, hashlib.sha256).digest()
+
+
+def with_msg_newline(kind: str, body: str) -> str:
+    if kind == "msg" and body and not body.endswith("\n"):
+        return body + "\n"
+    return body
+
+
+def make_frame(
+    kind: str,
+    body: str,
+    key: bytes,
+    session_id: str,
+    from_name: str,
+    queued_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One frame dict. session_id and from are required and always written.
+
+    queued_at is written (and MAC-covered) only when set; outbox flushes
+    pass it, every other frame does not.
+    """
+    raw = body.encode("utf-8")
+    frame: Dict[str, Any] = {
+        "v": 1,
+        "alg": ALG,
+        "kind": kind,
+        "session_id": session_id,
+        "from": from_name,
+        "mac_b64": b64e(frame_mac(key, from_name, raw, queued_at)),
+        "body_b64": b64e(raw),
+    }
+    if queued_at is not None:
+        frame["queued_at"] = queued_at
+    return frame
+
+
+def make_ack(key: bytes, session_id: str, from_name: str) -> Dict[str, Any]:
+    """The automatic ack frame: empty body, from covered, never queued.
+
+    Every connecting subcommand sends exactly one right after the dial,
+    before outbox frames and before its own frames.
+    """
+    return make_frame("ack", "", key, session_id, from_name)
+
+
+def line_bytes(fr: Dict[str, Any]) -> bytes:
+    return (json.dumps(fr, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+
+
+def verify(
+    obj: Dict[str, Any], key: bytes
+) -> Tuple[bool, str, str, Optional[str]]:
+    if obj.get("alg") != ALG:
+        return False, "", "", None
+    try:
+        body = b64d(obj["body_b64"])
+        mac = b64d(obj["mac_b64"])
+    except Exception:
+        return False, "", "", None
+    from_name: Optional[str] = None
+    if "from" in obj:
+        raw_from = obj["from"]
+        if not valid_from_name(raw_from):
+            return False, "", "", None
+        from_name = raw_from
+    queued_at: Optional[str] = None
+    if "queued_at" in obj:
+        raw_queued = obj["queued_at"]
+        if not valid_queued_at(raw_queued):
+            return False, "", "", None
+        if from_name is None:
+            return False, "", "", None
+        queued_at = raw_queued
+    if not hmac.compare_digest(mac, frame_mac(key, from_name, body, queued_at)):
+        return False, "", "", None
+    kind = obj.get("kind")
+    if not isinstance(kind, str) or kind not in KINDS:
+        return False, "", "", None
+    if queued_at is not None and kind not in OUTBOX_KINDS:
+        return False, "", "", None
+    try:
+        return True, body.decode("utf-8"), kind, queued_at
+    except UnicodeDecodeError:
+        return False, "", "", None
+
+
+def connect(host: str, port: int, timeout: float) -> socket.socket:
+    s = socket.create_connection((host, port), timeout=timeout)
+    try:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    return s
+
+
+def sendall(sock: socket.socket, frames: List[Dict[str, Any]], half_close: bool) -> None:
+    sock.sendall(b"".join(line_bytes(f) for f in frames))
+    if half_close:
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def session_id_arg(text: str) -> str:
+    """--session ID: non-empty; argparse turns the error into exit 2."""
+    if not text:
+        raise argparse.ArgumentTypeError("session id must not be empty")
+    return text
+
+
+def add_endpoint(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--host", required=True)
+    p.add_argument("--port", type=int, required=True)
+    p.add_argument("--key-b64", required=True)
+    p.add_argument(
+        "--session",
+        required=True,
+        type=session_id_arg,
+        metavar="ID",
+        help="session id from the webhook's session_id (required; every "
+        "frame carries it)",
+    )
+    p.add_argument(
+        "--from",
+        dest="from_name",
+        default=os.environ.get("ASKSOUL_BOT_NAME") or "Soul",
+        type=from_name_arg,
+        metavar="NAME",
+        help="dialer name in every frame's from field (default: "
+        "$ASKSOUL_BOT_NAME or Soul; other bots pass their own name)",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=float(os.environ.get("ASKSOUL_TCP_TIMEOUT", "30")),
+    )
+    p.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="also print delivery JSON after the DELIVERY line",
+    )
+
+
+DRAIN_SEC = float(os.environ.get("ASKSOUL_DRAIN_SEC", "5"))
+EOF_GRACE_SEC = 2.0
+OUTBOX_TTL_SEC = float(os.environ.get("ASKSOUL_OUTBOX_TTL_SEC", "604800"))
+OUTBOX_MAX_ROWS = max(1, int(os.environ.get("ASKSOUL_OUTBOX_MAX_ROWS", "500")))
+
+
+def queued_display(queued_at: str) -> str:
+    """A validated queued_at as "YYYY-MM-DD HH:MM <offset>" (Z as +00:00)."""
+    offset = "+00:00" if queued_at.endswith("Z") else queued_at[19:]
+    return f"{queued_at[:10]} {queued_at[11:16]} {offset}"
+
+
+def emit_inbound(kind: str, body: str, queued_at: Optional[str] = None) -> None:
+    """One verified inbound frame -> stdout (one-shot subcommands)."""
+    if kind == "msg":
+        prefix = f"[queued {queued_display(queued_at)}] " if queued_at else ""
+        sys.stdout.write(prefix + (body if body.endswith("\n") else body + "\n"))
+    elif kind == "status":
+        sys.stdout.write(f"# status: {body.strip()}\n")
+    elif kind == "relayed":
+        suffix = f" (queued {queued_display(queued_at)})" if queued_at else ""
+        sys.stdout.write(f"# relayed: {body.strip()}{suffix}\n")
+    elif kind == "close":
+        reason = body.strip()
+        sys.stdout.write(f"# close: {reason}\n" if reason else "# close\n")
+    sys.stdout.flush()
+
+
+def parse_lines(
+    buf: bytes, key: bytes
+) -> Tuple[bytes, List[Tuple[str, str, Optional[str]]]]:
+    """Split complete lines off buf.
+
+    Returns (rest, verified (kind, body, queued_at) list).
+    """
+    out: List[Tuple[str, str, Optional[str]]] = []
+    while b"\n" in buf:
+        raw, buf = buf.split(b"\n", 1)
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            print("asksoul-talk: bad json", file=sys.stderr)
+            continue
+        if not isinstance(obj, dict):
+            continue
+        ok, body, kind, queued_at = verify(obj, key)
+        if not ok:
+            print("asksoul-talk: bad frame discarded (mac or kind)", file=sys.stderr)
+            continue
+        out.append((kind, body, queued_at))
+    return buf, out
+
+
+def drain(sock: socket.socket, key: bytes, buf: bytes, window: float) -> Tuple[bool, int]:
+    """Print every inbound frame for `window` s, then end the connection.
+
+    Returns (cli_closed, frames_printed). Ends early on EOF or kind=close.
+    After the window: shutdown(write) so the CLI sees a plain disconnect (no
+    kind=close; its session goes on), then keep printing until the CLI's EOF
+    (at most EOF_GRACE_SEC), so nothing the CLI sent in flight is dropped.
+    """
+    n = 0
+    sock.setblocking(False)
+
+    def pump(until: float) -> Optional[bool]:
+        """None = window over; False = EOF; True = the CLI sent close."""
+        nonlocal buf, n
+        while True:
+            left = until - time.time()
+            if left <= 0:
+                return None
+            try:
+                ready, _, _ = select.select([sock], [], [], left)
+            except (ValueError, OSError):
+                return False
+            if not ready:
+                return None
+            try:
+                chunk = sock.recv(65536)
+            except BlockingIOError:
+                continue
+            except OSError:
+                return False
+            if not chunk:
+                return False
+            buf += chunk
+            buf, frames = parse_lines(buf, key)
+            for kind, body, queued_at in frames:
+                emit_inbound(kind, body, queued_at)
+                n += 1
+                if kind == "close":
+                    return True
+
+    buf, frames = parse_lines(buf, key)
+    for kind, body, queued_at in frames:
+        emit_inbound(kind, body, queued_at)
+        n += 1
+        if kind == "close":
+            return True, n
+    r = pump(time.time() + window)
+    if r is not None:
+        return r, n
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        return False, n
+    r = pump(time.time() + EOF_GRACE_SEC)
+    return bool(r), n
+
+
+def outbox_path() -> str:
+    """Outbox DB path: ASKSOUL_OUTBOX_DB, else the XDG state dir."""
+    env = os.environ.get("ASKSOUL_OUTBOX_DB")
+    if env:
+        return env
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(state, "asksoul-talk", "outbox.sqlite3")
+
+
+def outbox_open() -> sqlite3.Connection:
+    """Open the outbox DB, creating dir 0700, file 0600 and the table."""
+    path = outbox_path()
+    parent = os.path.dirname(path)
+    if parent:
+        if os.path.isdir(parent):
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass  # e.g. a shared dir we do not own
+        else:
+            os.makedirs(parent, mode=0o700)
+    umask = os.umask(0o177)
+    try:
+        con = sqlite3.connect(path, timeout=60)
+    finally:
+        os.umask(umask)
+    os.chmod(path, 0o600)
+    con.isolation_level = None
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS outbox("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_id TEXT NOT NULL,"
+        " created_at REAL NOT NULL,"
+        " expires_at REAL NOT NULL,"
+        " from_name TEXT NOT NULL,"
+        " kind TEXT NOT NULL,"
+        " body TEXT NOT NULL)"
+    )
+    con.execute("CREATE INDEX IF NOT EXISTS outbox_session ON outbox(session_id, id)")
+    return con
+
+
+def outbox_queue(frames: List[Dict[str, Any]], sid: str) -> int:
+    """Store this call's msg/relayed frames (never status/close).
+
+    Expired rows and the row cap go in the same transaction. Returns how many
+    rows were stored; 0 means nothing queueable (the caller keeps today's
+    behavior for the failed dial/send).
+    """
+    queue = [
+        (f["from"], f["kind"], b64d(f["body_b64"]).decode("utf-8"))
+        for f in frames
+        if f["kind"] in OUTBOX_KINDS
+    ]
+    if not queue:
+        return 0
+    con = outbox_open()
+    try:
+        now = time.time()
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("DELETE FROM outbox WHERE expires_at <= ?", (now,))
+        for from_name, kind, body in queue:
+            con.execute(
+                "INSERT INTO outbox"
+                " (session_id, created_at, expires_at, from_name, kind, body)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (sid, now, now + OUTBOX_TTL_SEC, from_name, kind, body),
+            )
+        con.execute(
+            "DELETE FROM outbox WHERE id NOT IN"
+            " (SELECT id FROM outbox ORDER BY id DESC LIMIT ?)",
+            (OUTBOX_MAX_ROWS,),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return len(queue)
+
+
+def outbox_flush(sock: socket.socket, key: bytes, sid: str) -> int:
+    """Send stored rows for sid before this call's new frames.
+
+    Returns how many rows were written and dropped. Raises OSError (after
+    ROLLBACK, so nothing is deleted) if that write fails.
+    """
+    path = outbox_path()
+    if not os.path.exists(path):
+        return 0  # do not create the DB just to read
+    con = sqlite3.connect(path, timeout=60)
+    try:
+        con.isolation_level = None
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("DELETE FROM outbox WHERE expires_at <= ?", (time.time(),))
+        rows = con.execute(
+            "SELECT id, created_at, from_name, kind, body FROM outbox"
+            " WHERE session_id = ? ORDER BY id",
+            (sid,),
+        ).fetchall()
+        if not rows:
+            con.commit()
+            return 0
+        try:
+            sendall(
+                sock,
+                [
+                    make_frame(
+                        kind,
+                        body,
+                        key,
+                        sid,
+                        from_name,
+                        datetime.datetime.fromtimestamp(created_at)
+                        .astimezone()
+                        .isoformat(timespec="seconds"),
+                    )
+                    for _oid, created_at, from_name, kind, body in rows
+                ],
+                half_close=False,
+            )
+        except OSError:
+            con.rollback()
+            raise
+        con.execute(
+            "DELETE FROM outbox WHERE id IN (%s)" % ",".join("?" * len(rows)),
+            [row[0] for row in rows],
+        )
+        con.commit()
+    finally:
+        con.close()
+    print(f"outbox: flushed {len(rows)} ({sid})", file=sys.stderr)
+    return len(rows)
+
+
+def queue_or_report(err: OSError, frames: List[Dict[str, Any]], sid: str) -> int:
+    """After a failed dial/send, queue this call's msg/relayed frames.
+
+    Returns the number stored (0 means the caller keeps today's behavior for
+    the error, e.g. exit 1 for status/close).
+    """
+    n = outbox_queue(frames, sid)
+    if n:
+        print(
+            f"asksoul-talk: dial/send failed: {err}; outbox: queued {n} ({sid})",
+            file=sys.stderr,
+        )
+    return n
+
+
+def fmt_local(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def print_summary(
+    args: argparse.Namespace,
+    frames: List[Dict[str, Any]],
+    sid: str,
+    flushed: int,
+    queued: Optional[int] = None,
+    inbound: Optional[int] = None,
+    cli_closed: Optional[bool] = None,
+    delivery: Optional[str] = None,
+) -> None:
+    """do_send's JSON summary on stderr ("queued" only when it was)."""
+    out: Dict[str, Any] = {
+        "ok": queued is None,
+        "host": args.host,
+        "port": args.port,
+        "frames": [f["kind"] for f in frames],
+        "session_id": sid,
+        "flushed": flushed,
+    }
+    if delivery is not None:
+        out["delivery"] = delivery
+    if queued is not None:
+        out["queued"] = queued
+    else:
+        out["inbound"] = inbound
+        out["cli_closed"] = cli_closed
+    print(json.dumps(out, ensure_ascii=False), file=sys.stderr)
+
+
+def do_send(args: argparse.Namespace) -> int:
+    key = b64d(args.key_b64)
+    if len(key) != 32:
+        print(f"asksoul-talk: key len {len(key)} (want 32)", file=sys.stderr)
+    print(
+        f"asksoul-talk: dial {args.host}:{args.port} key_fp={key_fp(key)}",
+        file=sys.stderr,
+    )
+    sid = args.session
+    frames: List[Dict[str, Any]] = []
+    if getattr(args, "accepted", False):
+        frames.append(make_frame("status", "accepted", key, sid, args.from_name))
+    if getattr(args, "thinking", False):
+        frames.append(make_frame("status", "thinking", key, sid, args.from_name))
+    if args.body is not None:
+        frames.append(
+            make_frame(
+                args.kind,
+                with_msg_newline(args.kind, args.body),
+                key,
+                sid,
+                args.from_name,
+            )
+        )
+    if not frames:
+        print("asksoul-talk: nothing to send", file=sys.stderr)
+        return 2
+    try:
+        sock = connect(args.host, args.port, args.timeout)
+    except OSError as e:
+        n = queue_or_report(e, frames, sid)
+        if not n:
+            print(f"asksoul-talk: dial failed: {e}", file=sys.stderr)
+            return 1  # nothing queueable (status/close only)
+        delivery = classify_delivery(reached=False)
+        emit_delivery(delivery, getattr(args, "as_json", False))
+        print_summary(args, frames, sid, flushed=0, queued=n, delivery=delivery)
+        return EXIT_QUEUED
+    flushed = 0
+    try:
+        try:
+            sendall(sock, [make_ack(key, sid, args.from_name)], half_close=False)
+            flushed = outbox_flush(sock, key, sid)
+            sendall(sock, frames, half_close=False)
+        except OSError as e:
+            n = queue_or_report(e, frames, sid)
+            if not n:
+                print(f"asksoul-talk: send failed: {e}", file=sys.stderr)
+                return 1
+            delivery = classify_delivery(reached=False)
+            emit_delivery(delivery, getattr(args, "as_json", False))
+            print_summary(
+                args, frames, sid, flushed=flushed, queued=n, delivery=delivery
+            )
+            return EXIT_QUEUED
+        cli_closed, n = drain(sock, key, b"", DRAIN_SEC)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    kind = next(
+        (
+            f["kind"]
+            for f in frames
+            if f["kind"] in ("relayed", "msg", "status", "close")
+        ),
+        "ack",
+    )
+    delivery = classify_delivery(reached=True, kind=kind)
+    emit_delivery(delivery, getattr(args, "as_json", False))
+    print_summary(
+        args,
+        frames,
+        sid,
+        flushed=flushed,
+        inbound=n,
+        cli_closed=cli_closed,
+        delivery=delivery,
+    )
+    return 7 if cli_closed else 0
+
+
+def do_ask(args: argparse.Namespace) -> int:
+    """Send one msg, hold the seat, return the caller's next msg."""
+    key = b64d(args.key_b64)
+    print(
+        f"asksoul-talk: dial {args.host}:{args.port} key_fp={key_fp(key)}",
+        file=sys.stderr,
+    )
+    sid = args.session
+    frames: List[Dict[str, Any]] = []
+    if args.accepted:
+        frames.append(make_frame("status", "accepted", key, sid, args.from_name))
+    frames.append(
+        make_frame(
+            "msg", with_msg_newline("msg", args.body), key, sid, args.from_name
+        )
+    )
+    try:
+        sock = connect(args.host, args.port, args.timeout)
+    except OSError as e:
+        if not queue_or_report(e, frames, sid):
+            raise
+        delivery = classify_delivery(reached=False)
+        emit_delivery(delivery, getattr(args, "as_json", False))
+        return EXIT_QUEUED
+    buf = b""
+    deadline = time.time() + args.wait
+    try:
+        try:
+            sendall(sock, [make_ack(key, sid, args.from_name)], half_close=False)
+            outbox_flush(sock, key, sid)
+            sendall(sock, frames, half_close=False)
+        except OSError as e:
+            if not queue_or_report(e, frames, sid):
+                print(f"asksoul-talk: send failed: {e}", file=sys.stderr)
+                return 1
+            delivery = classify_delivery(reached=False)
+            emit_delivery(delivery, getattr(args, "as_json", False))
+            return EXIT_QUEUED
+        print("# sent; holding seat for the next line", file=sys.stderr)
+        sock.setblocking(False)
+        while time.time() < deadline:
+            ready, _, _ = select.select([sock], [], [], 0.5)
+            if not ready:
+                continue
+            try:
+                chunk = sock.recv(65536)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                print("# peer disconnected", file=sys.stderr)
+                emit_delivery(
+                    classify_delivery(reached=True, kind="msg"),
+                    getattr(args, "as_json", False),
+                )
+                return 7
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    print("asksoul-talk: bad json", file=sys.stderr)
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                ok, body, kind, queued_at = verify(obj, key)
+                if not ok:
+                    print("asksoul-talk: bad frame discarded (mac or kind)", file=sys.stderr)
+                    continue
+                if kind == "status":
+                    print(f"# status: {body}", file=sys.stderr)
+                    continue
+                if kind == "close":
+                    if body:
+                        sys.stdout.write(body if body.endswith("\n") else body + "\n")
+                        sys.stdout.flush()
+                    print("# close: the CLI closed the session", file=sys.stderr)
+                    emit_delivery(
+                        classify_delivery(reached=True, kind="msg"),
+                        getattr(args, "as_json", False),
+                    )
+                    return 7
+                if kind != "msg":
+                    continue
+                if queued_at:
+                    sys.stdout.write(f"[queued {queued_display(queued_at)}] ")
+                sys.stdout.write(body if body.endswith("\n") else body + "\n")
+                sys.stdout.flush()
+                # More lines may already be in flight; print, don't drop.
+                cli_closed, _ = drain(sock, key, buf, 1.0)
+                if cli_closed:
+                    print("# close: the CLI closed the session", file=sys.stderr)
+                    emit_delivery(
+                        classify_delivery(reached=True, kind="msg"),
+                        getattr(args, "as_json", False),
+                    )
+                    return 7
+                emit_delivery(
+                    classify_delivery(reached=True, kind="msg"),
+                    getattr(args, "as_json", False),
+                )
+                return 0
+        print("# wait timeout; disconnected without close", file=sys.stderr)
+        emit_delivery(
+            classify_delivery(reached=True, kind="msg"),
+            getattr(args, "as_json", False),
+        )
+        return 3
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def do_outbox(args: argparse.Namespace) -> int:
+    """List pending rows, read-only; nothing is ever deleted here."""
+    path = outbox_path()
+    if not os.path.exists(path):
+        print("outbox: empty")
+        return 0
+    sql = (
+        "SELECT id, session_id, created_at, expires_at, from_name, kind, body"
+        " FROM outbox"
+    )
+    params: Tuple[Any, ...] = ()
+    if args.session:
+        sql += " WHERE session_id = ?"
+        params = (args.session,)
+    sql += " ORDER BY id"
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
+    try:
+        rows = con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+    now = time.time()
+    print(
+        "\t".join(
+            ["STATE", "ID", "SESSION", "CREATED", "EXPIRES", "FROM", "KIND", "BODY"]
+        )
+    )
+    for oid, sid, created, expires, from_name, kind, body in rows:
+        print(
+            "\t".join(
+                [
+                    "expired" if expires <= now else "pending",
+                    str(oid),
+                    sid,
+                    fmt_local(created),
+                    fmt_local(expires),
+                    from_name,
+                    kind,
+                    body[:60].replace("\n", "\\n"),
+                ]
+            )
+        )
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="asksoul-talk",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="bot → CLI asksoul session helper. One script: paste usage into handoffs.",
+        epilog=(
+            "Crypto: host+port+key_b64 are one atomic triple from THIS webhook;\n"
+            "never reuse an old key by session_id; new port replaces any saved handoff.\n"
+            "Every frame carries from=NAME (--from NAME, default Soul; other bots\n"
+            "pass their own name): mac = HMAC(key, NAME + newline + body).\n"
+            "Every dial sends kind=ack first (automatic, no flag), then any\n"
+            "outbox frames, then this call's frames; ack = the dialer got the\n"
+            "session's latest line(s); it is not an answer.\n"
+            "Delivery status (stdout, end of each dialing call):\n"
+            "  DELIVERY ack          frames reached the CLI (successful dial)\n"
+            "  DELIVERY relayed      this call sent kind=relayed and reached the CLI\n"
+            "  DELIVERY unconfirmed  dial/write failed; frames queued (exit 4)\n"
+            "With --json, one JSON object {\"delivery\":\"...\"} follows that line.\n"
+            "Three layers CLI callers see (keep apart): ack / relayed / [bot] answer.\n"
+            "The bot is woken by the webhook; cold start usually needs a minute or more —\n"
+            "CLI callers should set --wait / -t in minutes, not a few seconds.\n"
+            "Ask and wait (you end with a question; exit 0 answer, 3 timeout, 7 closed,\n"
+            "4 queued in outbox):\n"
+            "  asksoul-talk ask --host H --port P --key-b64 K "
+            "--session ID --wait 300 --body 'TEXT'\n"
+            "One-shot (nothing more to hear; listens ~5 s and prints what the CLI sends;\n"
+            "exit 0 sent, 7 the CLI closed, 1 failed, 4 queued in outbox):\n"
+            "  asksoul-talk send --host H --port P --key-b64 K "
+            "--session ID --kind msg --body 'TEXT'\n"
+            "Relay done (after delivering to another bot):\n"
+            "  asksoul-talk relayed --host H --port P --key-b64 K "
+            "--session ID --to NAME\n"
+            "Outbox: msg/relayed that cannot reach the CLI are stored locally per\n"
+            "session_id (no keys) and the call exits 4; every later dial for that\n"
+            "session_id (any subcommand, using that webhook's own host/port/key)\n"
+            "sends them first, in order, then the new frame. Stored frames are re-signed\n"
+            "with the current key and marked with queued_at (original attempt time),\n"
+            "so the CLI shows them as queued. Rows go away only after a successful write.\n"
+            "status and close are never queued. TTL 7 days and 500-row cap enforced\n"
+            "on insert (env ASKSOUL_OUTBOX_TTL_SEC, ASKSOUL_OUTBOX_MAX_ROWS,\n"
+            "ASKSOUL_OUTBOX_DB); `outbox` lists pending rows.\n"
+            "Free the connection: disconnect without close. kind=close ends the CLI session."
+        ),
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser(
+        "send",
+        help="send one shot (optional status then body); print the CLI's frames for ~5 s (0 sent, 7 closed, 4 queued)",
+    )
+    add_endpoint(s)
+    s.add_argument("--body", default=None)
+    s.add_argument(
+        "--kind",
+        default="msg",
+        choices=["msg", "status", "close", "relayed"],
+    )
+    s.add_argument("--accepted", action="store_true")
+    s.add_argument("--thinking", action="store_true")
+    s.set_defaults(func=do_send)
+
+    st = sub.add_parser("status", help="status frame only")
+    add_endpoint(st)
+    st.add_argument("--body", required=True)
+    st.set_defaults(
+        func=do_send, kind="status", accepted=False, thinking=False
+    )
+
+    cl = sub.add_parser("close", help="close frame")
+    add_endpoint(cl)
+    cl.add_argument("--body", default="")
+    cl.set_defaults(
+        func=do_send, kind="close", accepted=False, thinking=False
+    )
+
+    rl = sub.add_parser(
+        "relayed",
+        help="kind=relayed: receipt for bot NAME; the CLI's turn exits 6, the session stays up, no resend (4 queued)",
+    )
+    add_endpoint(rl)
+    rl.add_argument("--to", dest="body", required=True, metavar="NAME")
+    rl.set_defaults(
+        func=do_send, kind="relayed", accepted=False, thinking=False
+    )
+
+    ak = sub.add_parser(
+        "ask",
+        help="send one msg, hold the seat, print the caller's next line (0 got, 3 timeout, 7 closed, 4 queued)",
+    )
+    add_endpoint(ak)
+    ak.add_argument("--body", required=True)
+    ak.add_argument("--accepted", action="store_true")
+    ak.add_argument("--wait", type=float, default=300.0, help="seconds to hold the seat")
+    ak.set_defaults(func=do_ask)
+
+    ob = sub.add_parser(
+        "outbox",
+        help="list msg/relayed frames queued locally, read-only (exit 0; nothing deleted)",
+    )
+    ob.add_argument(
+        "--session",
+        type=session_id_arg,
+        metavar="ID",
+        help="only rows for this session id (default: all)",
+    )
+    ob.set_defaults(func=do_outbox)
+
+    args = p.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
