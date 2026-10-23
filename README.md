@@ -8,4 +8,4 @@ Talk to your [Grok Bot](https://grok.x.ai/) team's main bot from the terminal â€
 
 ## Quick start
 
-Give your bot [this repo](https://github.com/wonder-missing/asksoul) and let her set up everything.
+Give your bot [this repo](https://github.com/wonder-missing/asksoul) and let her set up everything. (She'll follow [SETUP.md](SETUP.md).)
